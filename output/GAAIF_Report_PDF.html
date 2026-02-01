@@ -580,6 +580,30 @@
                 <img src="pdf_charts/fx_sensitivity.png" alt="FX Sensitivity">
             </div>
         </div>
+
+        <div class="chart-row">
+            <div class="chart-container">
+                <img src="pdf_charts/correlation_sensitivity.png" alt="Correlation Sensitivity">
+            </div>
+            <div class="chart-container">
+                <img src="pdf_charts/volatility_surface.png" alt="Volatility Surface">
+            </div>
+        </div>
+
+        <div class="alert alert-info" style="margin-top: 15px;">
+            <strong>Enhanced Analysis:</strong> Sensitivity charts now include 20 data points for Gold and EUR/USD, 15 points for correlation, and a 2D volatility surface (6×5 grid). This provides comprehensive coverage of the parameter space.
+        </div>
+    </div>
+
+    <!-- Convergence Analysis -->
+    <div class="section">
+        <h2 class="section-title">6b. Monte Carlo Convergence Analysis</h2>
+
+        <div class="chart-container">
+            <img src="pdf_charts/convergence.png" alt="Convergence Analysis">
+        </div>
+
+        <p style="font-size: 9pt; margin-top: 10px;">The convergence analysis demonstrates that the Monte Carlo simulation stabilizes around EUR 46M with 100,000+ paths. The 95% confidence interval narrows significantly as path count increases, with standard error decreasing from ±EUR 3.85M at 1,000 paths to ±EUR 0.29M at 200,000 paths.</p>
     </div>
 
     <div class="page-break"></div>
