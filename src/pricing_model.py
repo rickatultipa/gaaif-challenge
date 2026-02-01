@@ -31,23 +31,25 @@ warnings.filterwarnings('ignore')
 @dataclass
 class MarketData:
     """Container for market data parameters."""
-    # Spot prices
-    gold_spot: float = 2750.0  # Current gold price (USD/oz)
-    eurusd_spot: float = 1.08  # Current EUR/USD rate
+    # Spot prices - UPDATED Feb 1, 2026
+    # Gold crashed from $5,608 high on Jan 28 to ~$4,900, still well above strike
+    gold_spot: float = 4900.0  # Current gold price (USD/oz) - Feb 2026
+    eurusd_spot: float = 1.19  # Current EUR/USD rate - near 4-year high
 
     # Interest rates (annualized, continuous compounding)
-    r_eur: float = 0.025  # EUR risk-free rate
-    r_usd: float = 0.045  # USD risk-free rate
+    r_eur: float = 0.025  # EUR risk-free rate (ECB)
+    r_usd: float = 0.0425  # USD risk-free rate (Fed has been cutting)
 
-    # Volatilities (annualized)
-    sigma_gold: float = 0.18  # Gold volatility (~18%)
-    sigma_eurusd: float = 0.08  # EUR/USD volatility (~8%)
+    # Volatilities (annualized) - INCREASED due to recent extreme moves
+    # Gold dropped 7%+ in one week - realized vol is spiking
+    sigma_gold: float = 0.28  # Gold volatility - elevated (~28% given recent crash)
+    sigma_eurusd: float = 0.10  # EUR/USD volatility (~10% - also elevated)
 
-    # Correlation
-    rho: float = -0.25  # Gold-EURUSD correlation (typically negative)
+    # Correlation - may have shifted during crisis
+    rho: float = -0.30  # Gold-EURUSD correlation (stronger negative in crisis)
 
     # Gold convenience yield
-    gold_yield: float = 0.005  # ~0.5% convenience yield
+    gold_yield: float = 0.003  # Reduced lease rate in high-price environment
 
 
 @dataclass
