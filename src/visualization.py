@@ -308,15 +308,30 @@ class ProductVisualizer:
         return fig
 
     def plot_payoff_diagram(self, contract_strike: float, notional: float,
-                            gold_range: tuple = (3500, 6000), save: bool = True) -> plt.Figure:
+                            gold_range: tuple = None, market=None,
+                            save: bool = True) -> plt.Figure:
         """
         Plot theoretical payoff diagram at maturity.
 
         Args:
             contract_strike: Strike price
             notional: Notional amount
-            gold_range: Range of gold prices to plot
+            gold_range: Range of gold prices to plot. If None, computed dynamically
+                        from market data and contract terms.
+            market: Optional MarketData for dynamic range computation
         """
+        if gold_range is None:
+            if market is not None:
+                from market_data import SensitivityRangeGenerator
+                from pricing_model import ContractTerms
+                # Create a minimal contract for range generation
+                dummy_contract = ContractTerms(strike=contract_strike)
+                rgen = SensitivityRangeGenerator(market, dummy_contract)
+                gold_range = rgen.payoff_diagram_range()
+            else:
+                # Fallback: center on strike with reasonable spread
+                spread = contract_strike * 0.3
+                gold_range = (contract_strike - spread, contract_strike + spread)
         fig, ax = plt.subplots(figsize=(12, 7))
 
         gold_prices = np.linspace(gold_range[0], gold_range[1], 200)

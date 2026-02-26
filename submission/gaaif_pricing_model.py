@@ -1,46 +1,363 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 ================================================================================
-GAAIF Challenge 2026 - Structured Gold Forward Pricing Model
+GAAIF CHALLENGE SUBMISSION - STRUCTURED FORWARD WITH DOUBLE KNOCK-OUT BARRIER
 ================================================================================
 
 Product: Gold Forward Contract with EUR/USD Double Knock-Out Barriers
+Issuer: Alphabank S.A.
+Client: Zeus Gold Group AG
 
 Contract Specifications:
-    - Notional Principal: EUR 500 Million
-    - Strike Price (K): USD 4,600/oz
-    - Tenor: 2 years (March 2026 - February 2028)
-    - Knock-Out Barriers: EUR/USD < 1.05 or EUR/USD > 1.25
-
-Settlement Formulas:
-    - Z Group Payoff: N × (P - K) / K
-    - A Bank Payoff:  N × (K - P) / K
-    where P = LBMA Gold Spot at settlement, K = Strike
+- Notional Principal: EUR 500 Million
+- Strike Price (K): $4,600/oz (LBMA Gold Spot)
+- Tenor: 2 years (March 1, 2026 - February 28, 2028)
+- Lower Barrier: EUR/USD = 1.05 (Knock-Out)
+- Upper Barrier: EUR/USD = 1.25 (Knock-Out)
+- Settlement: Z Group: N × (P - K) / K; A Bank: N × (K - P) / K
 
 Mathematical Framework:
-    Two-factor correlated Geometric Brownian Motion under risk-neutral measure:
-
-    Gold:     dS/S = (r_USD - q) dt + σ_S dW^S
-    EUR/USD:  dX/X = (r_EUR - r_USD) dt + σ_X dW^X
-
-    Correlation: dW^S · dW^X = ρ dt
+- Two-factor correlated Geometric Brownian Motion (GBM)
+- Risk-neutral pricing with appropriate measure
+- Monte Carlo simulation with variance reduction techniques
 
 Author: GAAIF Challenge Submission
-Date: February 2026
+Date: January 2026
 ================================================================================
 """
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-from typing import Tuple, Dict, Optional
+from scipy import stats
+from dataclasses import dataclass, field
+from typing import Tuple, Optional, Dict, Any, List
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.ticker import FuncFormatter
 import warnings
+import os
+import logging
+from datetime import datetime
+
 warnings.filterwarnings('ignore')
+logger = logging.getLogger(__name__)
+
+# Try to import optional dependencies
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
+
+# =============================================================================
+# VOLATILITY ESTIMATOR (inlined from market_data.py)
+# =============================================================================
+
+class VolatilityEstimator:
+    """Estimates volatilities and correlations from historical data."""
+
+    @staticmethod
+    def calculate_ewma_volatility(prices: pd.Series, lambda_: float = 0.94,
+                                  annualize: bool = True) -> pd.Series:
+        """Calculate EWMA (RiskMetrics-style) volatility."""
+        log_returns = np.log(prices / prices.shift(1))
+        variance = log_returns.ewm(alpha=1-lambda_, adjust=False).var()
+        vol = np.sqrt(variance)
+        if annualize:
+            vol = vol * np.sqrt(252)
+        return vol
+
+    @staticmethod
+    def calculate_correlation(series1: pd.Series, series2: pd.Series,
+                             window: int = 252) -> pd.Series:
+        """Calculate rolling correlation between two return series."""
+        ret1 = np.log(series1 / series1.shift(1))
+        ret2 = np.log(series2 / series2.shift(1))
+        return ret1.rolling(window=window).corr(ret2)
 
 
 # =============================================================================
-# DATA CLASSES FOR MODEL INPUTS
+# MARKET DATA PROVENANCE
+# =============================================================================
+
+@dataclass
+class MarketDataProvenance:
+    """Tracks the source and freshness of each market data parameter."""
+    source: str
+    timestamp: str
+    ticker: str
+    raw_value: float
+
+
+# =============================================================================
+# MARKET DATA PROVIDER
+# =============================================================================
+
+class MarketDataProvider:
+    """
+    Single source of truth for all market data parameters.
+    Fetches live data via yfinance with graceful fallback.
+    """
+
+    FALLBACK_DEFAULTS = {
+        'gold_spot': 5200.0,
+        'eurusd_spot': 1.18,
+        'r_usd': 0.041,
+        'r_eur': 0.020,
+        'sigma_gold': 0.37,
+        'sigma_eurusd': 0.10,
+        'rho': -0.30,
+        'gold_yield': 0.003,
+    }
+
+    def __init__(self, use_live: bool = True, eur_rate: float = 0.020,
+                 vol_lambda: float = 0.94, corr_window: int = 126):
+        self.use_live = use_live and HAS_YFINANCE
+        self.eur_rate = eur_rate
+        self.vol_lambda = vol_lambda
+        self.corr_window = corr_window
+        self._provenance: Dict[str, MarketDataProvenance] = {}
+
+    def fetch_market_data(self) -> 'MarketData':
+        """Main entry point: returns a MarketData object."""
+        params = dict(self.FALLBACK_DEFAULTS)
+        params['r_eur'] = self.eur_rate
+        now = datetime.now().isoformat(timespec='seconds')
+
+        for key, val in params.items():
+            self._provenance[key] = MarketDataProvenance(
+                source='fallback', timestamp=now, ticker='N/A', raw_value=val
+            )
+
+        if self.use_live:
+            try:
+                self._fetch_spots(params, now)
+                self._estimate_volatilities(params, now)
+                self._estimate_correlation(params, now)
+                self._fetch_interest_rates(params, now)
+                self._estimate_convenience_yield(params, now)
+            except Exception as e:
+                print(f"  [WARN] Live data fetch failed: {e}")
+                print(f"  [INFO] Using fallback defaults (Feb 26, 2026 snapshot)")
+
+        return MarketData(**params)
+
+    def _fetch_spots(self, params: dict, now: str):
+        try:
+            gold = yf.download("GC=F", period="5d", progress=False)
+            if gold is not None and len(gold) > 0:
+                close = gold['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                val = float(close.dropna().iloc[-1])
+                params['gold_spot'] = val
+                self._provenance['gold_spot'] = MarketDataProvenance(
+                    source='live', timestamp=now, ticker='GC=F', raw_value=val)
+        except Exception:
+            pass
+        try:
+            fx = yf.download("EURUSD=X", period="5d", progress=False)
+            if fx is not None and len(fx) > 0:
+                close = fx['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                val = float(close.dropna().iloc[-1])
+                params['eurusd_spot'] = val
+                self._provenance['eurusd_spot'] = MarketDataProvenance(
+                    source='live', timestamp=now, ticker='EURUSD=X', raw_value=val)
+        except Exception:
+            pass
+
+    def _estimate_volatilities(self, params: dict, now: str):
+        estimator = VolatilityEstimator()
+        try:
+            gold_hist = yf.download("GC=F", period="2y", progress=False)
+            if gold_hist is not None and len(gold_hist) > 20:
+                close = gold_hist['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                ewma_vol = estimator.calculate_ewma_volatility(
+                    close.dropna(), lambda_=self.vol_lambda)
+                val = float(ewma_vol.dropna().iloc[-1])
+                if 0.05 < val < 1.5:
+                    params['sigma_gold'] = val
+                    self._provenance['sigma_gold'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='GC=F', raw_value=val)
+        except Exception:
+            pass
+        try:
+            fx_hist = yf.download("EURUSD=X", period="2y", progress=False)
+            if fx_hist is not None and len(fx_hist) > 20:
+                close = fx_hist['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                ewma_vol = estimator.calculate_ewma_volatility(
+                    close.dropna(), lambda_=self.vol_lambda)
+                val = float(ewma_vol.dropna().iloc[-1])
+                if 0.02 < val < 0.5:
+                    params['sigma_eurusd'] = val
+                    self._provenance['sigma_eurusd'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='EURUSD=X', raw_value=val)
+        except Exception:
+            pass
+
+    def _estimate_correlation(self, params: dict, now: str):
+        estimator = VolatilityEstimator()
+        try:
+            gold_hist = yf.download("GC=F", period="2y", progress=False)
+            fx_hist = yf.download("EURUSD=X", period="2y", progress=False)
+            if (gold_hist is not None and fx_hist is not None and
+                    len(gold_hist) > self.corr_window and len(fx_hist) > self.corr_window):
+                gold_close = gold_hist['Close']
+                fx_close = fx_hist['Close']
+                if hasattr(gold_close, 'columns'):
+                    gold_close = gold_close.iloc[:, 0]
+                if hasattr(fx_close, 'columns'):
+                    fx_close = fx_close.iloc[:, 0]
+                corr_series = estimator.calculate_correlation(
+                    gold_close.dropna(), fx_close.dropna(), window=self.corr_window)
+                val = float(corr_series.dropna().iloc[-1])
+                if -1 <= val <= 1:
+                    params['rho'] = val
+                    self._provenance['rho'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='GC=F vs EURUSD=X', raw_value=val)
+        except Exception:
+            pass
+
+    def _fetch_interest_rates(self, params: dict, now: str):
+        try:
+            irx = yf.download("^IRX", period="5d", progress=False)
+            if irx is not None and len(irx) > 0:
+                close = irx['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                val = float(close.dropna().iloc[-1]) / 100.0
+                if 0 < val < 0.15:
+                    params['r_usd'] = val
+                    self._provenance['r_usd'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='^IRX', raw_value=val)
+        except Exception:
+            pass
+        params['r_eur'] = self.eur_rate
+        self._provenance['r_eur'] = MarketDataProvenance(
+            source='configured', timestamp=now, ticker='N/A (ECB)', raw_value=self.eur_rate)
+
+    def _estimate_convenience_yield(self, params: dict, now: str):
+        try:
+            spot_data = yf.download("GC=F", period="5d", progress=False)
+            far_data = yf.download("GCJ26.CMX", period="5d", progress=False)
+            if (spot_data is not None and far_data is not None and
+                    len(spot_data) > 0 and len(far_data) > 0):
+                s_close = spot_data['Close']
+                f_close = far_data['Close']
+                if hasattr(s_close, 'columns'):
+                    s_close = s_close.iloc[:, 0]
+                if hasattr(f_close, 'columns'):
+                    f_close = f_close.iloc[:, 0]
+                S = float(s_close.dropna().iloc[-1])
+                F = float(f_close.dropna().iloc[-1])
+                T = 0.25
+                if S > 0 and F > 0:
+                    q = params['r_usd'] - np.log(F / S) / T
+                    q = max(0.0, min(q, 0.05))
+                    params['gold_yield'] = q
+                    self._provenance['gold_yield'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='GC=F vs GCJ26.CMX', raw_value=q)
+        except Exception:
+            pass
+
+    def get_provenance_report(self) -> str:
+        lines = ["=" * 70, "DATA PROVENANCE REPORT", "=" * 70]
+        param_labels = {
+            'gold_spot': 'Gold Spot (USD/oz)', 'eurusd_spot': 'EUR/USD Spot',
+            'r_usd': 'USD Risk-Free Rate', 'r_eur': 'EUR Risk-Free Rate',
+            'sigma_gold': 'Gold Volatility (EWMA)', 'sigma_eurusd': 'EUR/USD Volatility (EWMA)',
+            'rho': 'Gold-EURUSD Correlation', 'gold_yield': 'Gold Convenience Yield',
+        }
+        for key, label in param_labels.items():
+            prov = self._provenance.get(key)
+            if prov:
+                if key in ('r_usd', 'r_eur', 'sigma_gold', 'sigma_eurusd', 'gold_yield'):
+                    val_str = f"{prov.raw_value*100:.2f}%"
+                elif key == 'rho':
+                    val_str = f"{prov.raw_value:.3f}"
+                elif key == 'gold_spot':
+                    val_str = f"${prov.raw_value:,.2f}"
+                else:
+                    val_str = f"{prov.raw_value:.4f}"
+                source_tag = f"[{prov.source.upper()}]"
+                ticker_str = f"({prov.ticker})" if prov.ticker != 'N/A' else ""
+                lines.append(f"  {label:<30s} {val_str:>12s}  {source_tag:<12s} {ticker_str}")
+        lines.append(f"\n  Timestamp: {self._provenance.get('gold_spot', MarketDataProvenance('','','',0)).timestamp}")
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+    def get_provenance_dataframe(self) -> pd.DataFrame:
+        rows = []
+        param_labels = {
+            'gold_spot': 'Gold Spot (USD/oz)', 'eurusd_spot': 'EUR/USD Spot',
+            'r_usd': 'USD Risk-Free Rate', 'r_eur': 'EUR Risk-Free Rate',
+            'sigma_gold': 'Gold Volatility (EWMA)', 'sigma_eurusd': 'EUR/USD Volatility (EWMA)',
+            'rho': 'Gold-EURUSD Correlation', 'gold_yield': 'Gold Convenience Yield',
+        }
+        for key, label in param_labels.items():
+            prov = self._provenance.get(key)
+            if prov:
+                rows.append({'Parameter': label, 'Value': prov.raw_value,
+                             'Source': prov.source, 'Ticker': prov.ticker,
+                             'Timestamp': prov.timestamp})
+        return pd.DataFrame(rows)
+
+
+# =============================================================================
+# SENSITIVITY RANGE GENERATOR
+# =============================================================================
+
+class SensitivityRangeGenerator:
+    """Generates dynamic sensitivity ranges based on current market conditions."""
+
+    def __init__(self, market: 'MarketData', contract: 'ContractTerms'):
+        self.market = market
+        self.contract = contract
+
+    def gold_spot_range(self, n: int = 9) -> np.ndarray:
+        S = self.market.gold_spot
+        sigma = self.market.sigma_gold
+        T = self.contract.tenor
+        spread = 2.0 * sigma * S * np.sqrt(T)
+        lo = max(S - spread, S * 0.3)
+        return np.linspace(lo, S + spread, n)
+
+    def eurusd_spot_range(self, n: int = 10) -> np.ndarray:
+        lo = self.contract.barrier_lower + 0.01
+        hi = self.contract.barrier_upper - 0.01
+        return np.linspace(lo, hi, n)
+
+    def gold_vol_range(self, n: int = 11) -> np.ndarray:
+        center = self.market.sigma_gold
+        return np.linspace(max(center * 0.4, 0.05), center * 2.0, n)
+
+    def eurusd_vol_range(self, n: int = 11) -> np.ndarray:
+        center = self.market.sigma_eurusd
+        return np.linspace(max(center * 0.4, 0.02), center * 2.0, n)
+
+    def correlation_range(self, n: int = 11) -> np.ndarray:
+        center = self.market.rho
+        return np.linspace(max(center - 0.4, -0.9), min(center + 0.4, 0.9), n)
+
+    def payoff_diagram_range(self) -> Tuple[float, float]:
+        K = self.contract.strike
+        S = self.market.gold_spot
+        sigma = self.market.sigma_gold
+        T = self.contract.tenor
+        spread = 2.0 * sigma * S * np.sqrt(T)
+        lo = max(min(K, S) - spread * 0.5, K * 0.5)
+        hi = max(K, S) + spread * 0.5
+        return (lo, hi)
+
+
+# =============================================================================
+# DATA CLASSES
 # =============================================================================
 
 @dataclass
@@ -48,34 +365,29 @@ class MarketData:
     """
     Container for market data parameters.
 
-    All rates are expressed as continuous compounding (annualized).
-    Volatilities are annualized standard deviations.
+    All rates are annualized and continuously compounded.
+    Volatilities are annualized (sqrt(252) scaling for daily).
 
-    Attributes:
-        gold_spot: Current LBMA gold spot price (USD/oz)
-        eurusd_spot: Current EUR/USD exchange rate
-        r_eur: EUR risk-free rate (ECB deposit rate)
-        r_usd: USD risk-free rate (Fed funds rate)
-        sigma_gold: Gold price volatility (annualized)
-        sigma_eurusd: EUR/USD volatility (annualized)
-        rho: Correlation between gold and EUR/USD returns
-        gold_yield: Gold convenience yield / lease rate
+    Default values are fallback references (Feb 26, 2026 snapshot).
+    In production, use MarketDataProvider to populate with live data.
     """
-    # Spot prices (as of February 1, 2026)
-    gold_spot: float = 4900.0       # USD/oz - elevated after rally to $5,608
-    eurusd_spot: float = 1.19       # Near 4-year high
+    # Spot prices - Feb 26, 2026 fallback reference
+    gold_spot: float = 5200.0       # Gold near ~$5,200/oz
+    eurusd_spot: float = 1.18       # EUR/USD ~1.18
 
-    # Interest rates (continuous compounding)
-    r_eur: float = 0.025            # 2.5% ECB deposit rate
-    r_usd: float = 0.0425           # 4.25% Fed funds rate
+    # Risk-free interest rates (continuous compounding)
+    r_eur: float = 0.020            # EUR risk-free rate (~2.0% ECB)
+    r_usd: float = 0.041            # USD risk-free rate (~4.1% T-bill proxy)
 
-    # Volatilities (annualized)
-    sigma_gold: float = 0.28        # 28% - elevated due to recent volatility
-    sigma_eurusd: float = 0.10      # 10% - also elevated
+    # Implied volatilities (annualized) - elevated regime
+    sigma_gold: float = 0.37        # Gold EWMA vol (GVZ ~37%)
+    sigma_eurusd: float = 0.10      # EUR/USD EWMA vol ~10%
 
-    # Correlation and yield
-    rho: float = -0.30              # Negative correlation (typical)
-    gold_yield: float = 0.003       # 0.3% convenience yield
+    # Asset correlation
+    rho: float = -0.30              # Gold-EURUSD correlation
+
+    # Gold convenience yield / lease rate
+    gold_yield: float = 0.003       # Convenience yield from futures term structure
 
 
 @dataclass
@@ -83,108 +395,123 @@ class ContractTerms:
     """
     Container for contract specifications.
 
-    Attributes:
-        notional: Notional principal in EUR
-        strike: Strike price in USD/oz
-        tenor: Contract tenor in years
-        barrier_lower: Lower EUR/USD knock-out barrier
-        barrier_upper: Upper EUR/USD knock-out barrier
+    All barrier monitoring is assumed continuous (European style early termination).
     """
-    notional: float = 500_000_000   # EUR 500 Million
-    strike: float = 4600.0          # USD 4,600/oz
-    tenor: float = 2.0              # 2 years
-    barrier_lower: float = 1.05     # Lower knock-out barrier
-    barrier_upper: float = 1.25     # Upper knock-out barrier
+    notional: float = 500_000_000   # EUR 500 Million notional
+    strike: float = 4600.0          # Gold strike price (USD/oz)
+    tenor: float = 2.0              # Contract tenor (years)
+    barrier_lower: float = 1.05     # Lower EUR/USD knock-out barrier
+    barrier_upper: float = 1.25     # Upper EUR/USD knock-out barrier
 
 
 # =============================================================================
-# MONTE CARLO SIMULATION ENGINE
+# CORRELATED GBM SIMULATOR
 # =============================================================================
 
 class CorrelatedGBMSimulator:
     """
     Simulates correlated Geometric Brownian Motion paths for Gold and EUR/USD.
 
-    Uses Cholesky decomposition to generate correlated random variables:
-        W^X = ρ·W^S + √(1-ρ²)·Z
-    where Z is independent standard normal.
+    Mathematical Model:
+    ------------------
+    Under the risk-neutral measure Q (EUR numeraire):
 
-    Implements exact log-normal solution for discretization:
-        S(t+dt) = S(t) × exp[(μ - σ²/2)dt + σ√dt·W]
+    Gold (in USD) with QUANTO ADJUSTMENT:
+        dS_t / S_t = (r_USD - q - ρ × σ_S × σ_X) dt + σ_S dW^S_t
+
+        The quanto adjustment (-ρ × σ_S × σ_X) accounts for the fact that
+        the underlying (gold) is denominated in USD but the payoff is in EUR.
+        With ρ < 0, this term is positive, slightly increasing gold's drift.
+
+    EUR/USD:
+        dX_t / X_t = (r_EUR - r_USD) dt + σ_X dW^X_t
+
+    Correlation structure:
+        dW^S_t × dW^X_t = ρ dt
+
+    Implementation uses Cholesky decomposition for correlated Brownian motions
+    and exact log-normal simulation for numerical stability.
     """
 
     def __init__(self, market: MarketData, contract: ContractTerms,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None, use_quanto_adjustment: bool = True):
         """
         Initialize simulator with market data and contract terms.
 
         Args:
-            market: MarketData instance with current market parameters
-            contract: ContractTerms instance with product specifications
+            market: MarketData object with spot prices, rates, and vols
+            contract: ContractTerms object with product specifications
             seed: Random seed for reproducibility
+            use_quanto_adjustment: Apply quanto drift adjustment (default True)
         """
         self.market = market
         self.contract = contract
         self.rng = np.random.default_rng(seed)
+        self.use_quanto_adjustment = use_quanto_adjustment
 
     def _generate_correlated_normals(self, n_paths: int,
-                                      n_steps: int) -> Tuple[np.ndarray, np.ndarray]:
+                                     n_steps: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Generate correlated standard normal random variables.
 
-        Uses Cholesky decomposition of correlation matrix:
-            [1   ρ  ]   [1      0        ] [1  ρ]
-            [ρ   1  ] = [ρ  √(1-ρ²)] [0  1]
+        Uses Cholesky decomposition:
+        [W1]   [1         0        ] [Z1]
+        [W2] = [ρ    √(1-ρ²)] [Z2]
+
+        where Z1, Z2 are independent standard normals.
 
         Args:
-            n_paths: Number of simulation paths
-            n_steps: Number of time steps per path
+            n_paths: Number of Monte Carlo paths
+            n_steps: Number of time steps
 
         Returns:
-            Tuple of (W_gold, W_eurusd) correlated normal arrays
+            Tuple of (W1, W2) correlated normal arrays
         """
         # Generate independent standard normals
         Z1 = self.rng.standard_normal((n_paths, n_steps))
         Z2 = self.rng.standard_normal((n_paths, n_steps))
 
-        # Apply Cholesky decomposition for correlation
+        # Apply Cholesky correlation structure
         rho = self.market.rho
-        W_gold = Z1
-        W_eurusd = rho * Z1 + np.sqrt(1 - rho**2) * Z2
+        W1 = Z1
+        W2 = rho * Z1 + np.sqrt(1 - rho**2) * Z2
 
-        return W_gold, W_eurusd
+        return W1, W2
 
     def simulate_paths(self, n_paths: int, n_steps: int,
-                       antithetic: bool = True) -> Dict:
+                       antithetic: bool = True) -> Dict[str, np.ndarray]:
         """
         Simulate correlated Gold and EUR/USD price paths.
 
+        Uses exact log-normal simulation:
+        S_{t+dt} = S_t × exp[(μ - σ²/2)dt + σ√dt × W]
+
         Args:
             n_paths: Number of Monte Carlo paths
-            n_steps: Number of time steps (e.g., 504 for daily over 2 years)
+            n_steps: Number of time steps
             antithetic: Use antithetic variates for variance reduction
 
         Returns:
             Dictionary containing:
-                - gold_paths: Array of gold price paths [n_paths × (n_steps+1)]
-                - eurusd_paths: Array of EUR/USD paths [n_paths × (n_steps+1)]
-                - times: Time grid array
-                - dt: Time step size
+            - gold_paths: Array of gold price paths [n_paths × (n_steps+1)]
+            - eurusd_paths: Array of EUR/USD paths [n_paths × (n_steps+1)]
+            - times: Time grid array
+            - dt: Time step size
         """
         dt = self.contract.tenor / n_steps
         sqrt_dt = np.sqrt(dt)
 
-        # Generate half paths if using antithetic variates
+        # For antithetic variates, generate half and mirror
         actual_paths = n_paths // 2 if antithetic else n_paths
-        W_gold, W_eurusd = self._generate_correlated_normals(actual_paths, n_steps)
 
-        # Mirror paths for antithetic variates
+        W1, W2 = self._generate_correlated_normals(actual_paths, n_steps)
+
         if antithetic:
-            W_gold = np.vstack([W_gold, -W_gold])
-            W_eurusd = np.vstack([W_eurusd, -W_eurusd])
+            W1 = np.vstack([W1, -W1])
+            W2 = np.vstack([W2, -W2])
             actual_paths = n_paths
 
-        # Initialize price arrays
+        # Initialize path arrays
         gold_paths = np.zeros((actual_paths, n_steps + 1))
         eurusd_paths = np.zeros((actual_paths, n_steps + 1))
 
@@ -192,50 +519,64 @@ class CorrelatedGBMSimulator:
         eurusd_paths[:, 0] = self.market.eurusd_spot
 
         # Risk-neutral drift terms
+        # Gold: μ_S = r_USD - q - ρ × σ_S × σ_X (quanto adjustment for EUR payoff)
+        # The quanto adjustment accounts for correlation between gold and EUR/USD
+        # when the underlying is in USD but the payoff currency is EUR
         gold_drift = self.market.r_usd - self.market.gold_yield
+        if self.use_quanto_adjustment:
+            quanto_adjustment = self.market.rho * self.market.sigma_gold * self.market.sigma_eurusd
+            gold_drift -= quanto_adjustment  # With ρ < 0, this increases drift
+        # EUR/USD: μ_X = r_EUR - r_USD (interest rate parity)
         eurusd_drift = self.market.r_eur - self.market.r_usd
 
-        # Simulate using exact log-normal solution
+        # Simulate using exact log-normal dynamics
         for t in range(n_steps):
-            # Gold: dS/S = (r_USD - q)dt + σ_S dW^S
+            # Gold price evolution
             gold_paths[:, t+1] = gold_paths[:, t] * np.exp(
                 (gold_drift - 0.5 * self.market.sigma_gold**2) * dt +
-                self.market.sigma_gold * sqrt_dt * W_gold[:, t]
+                self.market.sigma_gold * sqrt_dt * W1[:, t]
             )
 
-            # EUR/USD: dX/X = (r_EUR - r_USD)dt + σ_X dW^X
+            # EUR/USD evolution
             eurusd_paths[:, t+1] = eurusd_paths[:, t] * np.exp(
                 (eurusd_drift - 0.5 * self.market.sigma_eurusd**2) * dt +
-                self.market.sigma_eurusd * sqrt_dt * W_eurusd[:, t]
+                self.market.sigma_eurusd * sqrt_dt * W2[:, t]
             )
+
+        times = np.linspace(0, self.contract.tenor, n_steps + 1)
 
         return {
             'gold_paths': gold_paths,
             'eurusd_paths': eurusd_paths,
-            'times': np.linspace(0, self.contract.tenor, n_steps + 1),
+            'times': times,
             'dt': dt
         }
 
-    def check_barrier_breach(self, eurusd_paths: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def check_barrier_breach(self,
+                             eurusd_paths: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Check for knock-out barrier breaches in EUR/USD paths.
+        Check for barrier breaches in EUR/USD paths.
+
+        The product features double knock-out barriers:
+        - Lower barrier: EUR/USD < 1.05 → Knock-out
+        - Upper barrier: EUR/USD > 1.25 → Knock-out
 
         Args:
-            eurusd_paths: Array of EUR/USD price paths
+            eurusd_paths: Array of EUR/USD paths
 
         Returns:
             Tuple of:
-                - knocked_out: Boolean array indicating knocked-out paths
-                - knockout_idx: Index of first breach for each path (-1 if none)
+            - knocked_out: Boolean array indicating knocked-out paths
+            - knockout_idx: Index of first barrier breach (-1 if no breach)
         """
-        n_paths = eurusd_paths.shape[0]
+        n_paths, n_steps = eurusd_paths.shape
 
         # Check barrier conditions
         below_lower = eurusd_paths < self.contract.barrier_lower
         above_upper = eurusd_paths > self.contract.barrier_upper
         breached = below_lower | above_upper
 
-        # Find first breach for each path
+        # Find first breach time for each path
         knocked_out = np.any(breached, axis=1)
         knockout_idx = np.full(n_paths, -1, dtype=int)
 
@@ -247,22 +588,37 @@ class CorrelatedGBMSimulator:
 
 
 # =============================================================================
-# PRICING ENGINE
+# STRUCTURED FORWARD PRICER
 # =============================================================================
 
 class StructuredForwardPricer:
     """
     Prices the structured gold forward with double knock-out barriers.
 
-    The product pays at maturity (or early termination):
-        Z Group: N × (P_τ - K) / K
-        A Bank:  N × (K - P_τ) / K
+    Product Payoff Structure:
+    ------------------------
+    At settlement time τ (maturity T or knock-out time, whichever comes first):
 
-    where τ = min(T, first barrier breach time).
+    Z Group's Payoff (EUR): N × (P_τ - K) / K
+    A Bank's Payoff (EUR):  N × (K - P_τ) / K
 
-    Implements variance reduction techniques:
-        1. Antithetic variates
-        2. Control variate (vanilla forward as control)
+    where:
+    - N = Notional Principal (EUR 500M)
+    - P_τ = LBMA Gold Spot Price at settlement (USD/oz)
+    - K = Strike Benchmark Price ($4,600/oz)
+
+    The knock-out feature terminates the contract if EUR/USD breaches
+    either the lower (1.05) or upper (1.25) barrier.
+
+    Pricing Methodology:
+    -------------------
+    Risk-neutral expectation under the EUR measure:
+
+    V_0 = E^Q[e^{-r_EUR × τ} × Payoff]
+
+    Computed via Monte Carlo simulation with:
+    - Antithetic variates
+    - Control variate (vanilla forward)
     """
 
     def __init__(self, market: MarketData, contract: ContractTerms):
@@ -270,32 +626,47 @@ class StructuredForwardPricer:
         Initialize pricer with market data and contract terms.
 
         Args:
-            market: MarketData instance
-            contract: ContractTerms instance
+            market: MarketData object
+            contract: ContractTerms object
         """
         self.market = market
         self.contract = contract
 
     def price_monte_carlo(self, n_paths: int = 100000, n_steps: int = 504,
                           seed: Optional[int] = 42, antithetic: bool = True,
-                          control_variate: bool = True) -> Dict:
+                          control_variate: bool = True,
+                          use_quanto_adjustment: bool = True) -> Dict[str, Any]:
         """
         Price the structured product using Monte Carlo simulation.
 
+        Implements variance reduction via:
+        1. Antithetic variates: Uses (W, -W) pairs
+        2. Control variate: Vanilla gold forward with known analytical price
+
         Args:
-            n_paths: Number of simulation paths (default: 100,000)
-            n_steps: Number of time steps (default: 504 ≈ daily for 2 years)
+            n_paths: Number of simulation paths
+            n_steps: Number of time steps (504 ≈ 252 trading days × 2 years)
             seed: Random seed for reproducibility
-            antithetic: Use antithetic variates
-            control_variate: Use control variate adjustment
+            antithetic: Enable antithetic variates
+            control_variate: Enable control variate
+            use_quanto_adjustment: Apply quanto drift adjustment for EUR payoff
 
         Returns:
-            Dictionary with comprehensive pricing results
+            Dictionary with:
+            - price_zgroup: Present value for Z Group (EUR)
+            - price_abank: Present value for A Bank (EUR)
+            - std_error: Monte Carlo standard error
+            - ci_95_lower/upper: 95% confidence interval bounds
+            - knockout_rate: Probability of barrier breach
+            - avg_knockout_time: Average time to knockout (if breached)
+            - lower_breach_rate: Rate of lower barrier breaches
+            - upper_breach_rate: Rate of upper barrier breaches
+            - Settlement data arrays for further analysis
         """
-        # Initialize simulator and generate paths
-        simulator = CorrelatedGBMSimulator(self.market, self.contract, seed)
-        sim_result = simulator.simulate_paths(n_paths, n_steps, antithetic)
+        simulator = CorrelatedGBMSimulator(self.market, self.contract, seed, use_quanto_adjustment)
 
+        # Generate paths
+        sim_result = simulator.simulate_paths(n_paths, n_steps, antithetic)
         gold_paths = sim_result['gold_paths']
         eurusd_paths = sim_result['eurusd_paths']
         times = sim_result['times']
@@ -310,16 +681,16 @@ class StructuredForwardPricer:
 
         for i in range(n_actual_paths):
             if knocked_out[i]:
-                # Early termination at knock-out
+                # Contract knocked out - settle at knockout time
                 idx = knockout_idx[i]
                 settlement_prices[i] = gold_paths[i, idx]
                 settlement_times[i] = times[idx]
             else:
-                # Settlement at maturity
+                # No knockout - settle at maturity
                 settlement_prices[i] = gold_paths[i, -1]
                 settlement_times[i] = self.contract.tenor
 
-        # Calculate payoffs (from Z Group perspective)
+        # Calculate payoffs (from Z Group's perspective)
         K = self.contract.strike
         N = self.contract.notional
         payoffs_zgroup = N * (settlement_prices - K) / K
@@ -333,40 +704,46 @@ class StructuredForwardPricer:
         # Control variate adjustment
         cv_adjustment = 0.0
         if control_variate:
-            # Vanilla forward as control variate
+            # Vanilla forward price (analytical)
             forward_price = self.market.gold_spot * np.exp(
                 (self.market.r_usd - self.market.gold_yield) * self.contract.tenor
             )
+
+            # Vanilla forward payoffs from simulation
             vanilla_payoffs = N * (gold_paths[:, -1] - K) / K
             vanilla_pv = vanilla_payoffs * np.exp(-self.market.r_eur * self.contract.tenor)
 
-            # Analytical vanilla forward price
-            analytical_vanilla = N * (forward_price - K) / K * \
-                                 np.exp(-self.market.r_eur * self.contract.tenor)
+            # Analytical vanilla forward PV
+            analytical_vanilla = N * (forward_price - K) / K * np.exp(
+                -self.market.r_eur * self.contract.tenor
+            )
 
-            # Optimal control variate coefficient
+            # Optimal control variate coefficient (minimizes variance)
             cov_matrix = np.cov(pv_zgroup, vanilla_pv)
             if cov_matrix[1, 1] > 0:
                 beta = cov_matrix[0, 1] / cov_matrix[1, 1]
                 cv_adjustment = beta * (analytical_vanilla - np.mean(vanilla_pv))
 
-        # Calculate statistics
+        # Compute statistics
         mean_pv_zgroup = np.mean(pv_zgroup) + cv_adjustment
         mean_pv_abank = np.mean(pv_abank) - cv_adjustment
         std_pv = np.std(pv_zgroup)
         se = std_pv / np.sqrt(n_actual_paths)
 
+        # 95% confidence interval
+        ci_95 = (mean_pv_zgroup - 1.96 * se, mean_pv_zgroup + 1.96 * se)
+
         # Knockout statistics
         knockout_rate = np.mean(knocked_out)
-        avg_ko_time = np.mean(settlement_times[knocked_out]) if np.any(knocked_out) else np.nan
+        avg_knockout_time = np.mean(settlement_times[knocked_out]) if np.any(knocked_out) else np.nan
 
         # Barrier breach breakdown
         if np.any(knocked_out):
             ko_eurusd = eurusd_paths[knocked_out, :]
             ko_idx = knockout_idx[knocked_out]
             ko_prices = np.array([ko_eurusd[i, ko_idx[i]] for i in range(len(ko_idx))])
-            lower_breach_rate = np.mean(ko_prices < self.contract.barrier_lower) * knockout_rate
-            upper_breach_rate = np.mean(ko_prices > self.contract.barrier_upper) * knockout_rate
+            lower_breach_rate = np.mean(ko_prices < self.contract.barrier_lower)
+            upper_breach_rate = np.mean(ko_prices > self.contract.barrier_upper)
         else:
             lower_breach_rate = 0.0
             upper_breach_rate = 0.0
@@ -375,100 +752,166 @@ class StructuredForwardPricer:
             'price_zgroup': mean_pv_zgroup,
             'price_abank': mean_pv_abank,
             'std_error': se,
-            'ci_95_lower': mean_pv_zgroup - 1.96 * se,
-            'ci_95_upper': mean_pv_zgroup + 1.96 * se,
+            'ci_95_lower': ci_95[0],
+            'ci_95_upper': ci_95[1],
             'knockout_rate': knockout_rate,
-            'avg_knockout_time': avg_ko_time,
-            'lower_breach_rate': lower_breach_rate,
-            'upper_breach_rate': upper_breach_rate,
-            'mean_settlement_price': np.mean(settlement_prices),
+            'avg_knockout_time': avg_knockout_time,
+            'lower_breach_rate': lower_breach_rate * knockout_rate,
+            'upper_breach_rate': upper_breach_rate * knockout_rate,
             'n_paths': n_actual_paths,
-            'n_steps': n_steps
+            'n_steps': n_steps,
+            'gold_paths': gold_paths,
+            'eurusd_paths': eurusd_paths,
+            'settlement_prices': settlement_prices,
+            'settlement_times': settlement_times,
+            'knocked_out': knocked_out
         }
 
-    def compute_greeks(self, bump_size: float = 0.01,
-                       n_paths: int = 50000, seed: int = 42) -> Dict:
+    def compute_greeks(self, base_result: Dict, bump_size: float = 0.01,
+                       n_paths: int = 50000, seed: int = 42) -> Dict[str, float]:
         """
         Compute option Greeks using finite difference method.
 
+        Greeks Computed:
+        ---------------
+        - Delta (Gold): ∂V/∂S_gold
+        - Gamma (Gold): ∂²V/∂S²_gold
+        - Delta (EUR/USD): ∂V/∂X_eurusd
+        - Vega (Gold): ∂V/∂σ_gold
+        - Rho (EUR): ∂V/∂r_EUR
+        - Correlation Sensitivity: ∂V/∂ρ
+
+        All computed via central difference where applicable.
+
         Args:
-            bump_size: Relative bump size for finite differences
-            n_paths: Number of paths for Greek computation
+            base_result: Pricing result dictionary
+            bump_size: Relative bump size for finite difference
+            n_paths: Number of paths for Greek calculation
             seed: Random seed
 
         Returns:
-            Dictionary with Delta, Gamma, Vega, Rho, and correlation sensitivity
+            Dictionary of Greek values
         """
-        base_result = self.price_monte_carlo(n_paths, 252, seed)
         base_price = base_result['price_zgroup']
 
-        greeks = {}
-
         # Delta (Gold) - central difference
-        for direction, mult in [('up', 1), ('down', -1)]:
-            m = MarketData(
-                gold_spot=self.market.gold_spot * (1 + mult * bump_size),
-                eurusd_spot=self.market.eurusd_spot,
-                r_eur=self.market.r_eur, r_usd=self.market.r_usd,
-                sigma_gold=self.market.sigma_gold,
-                sigma_eurusd=self.market.sigma_eurusd,
-                rho=self.market.rho, gold_yield=self.market.gold_yield
-            )
-            p = StructuredForwardPricer(m, self.contract)
-            greeks[f'gold_{direction}'] = p.price_monte_carlo(n_paths, 252, seed)['price_zgroup']
+        market_up = MarketData(
+            gold_spot=self.market.gold_spot * (1 + bump_size),
+            eurusd_spot=self.market.eurusd_spot,
+            r_eur=self.market.r_eur, r_usd=self.market.r_usd,
+            sigma_gold=self.market.sigma_gold, sigma_eurusd=self.market.sigma_eurusd,
+            rho=self.market.rho, gold_yield=self.market.gold_yield
+        )
+        market_down = MarketData(
+            gold_spot=self.market.gold_spot * (1 - bump_size),
+            eurusd_spot=self.market.eurusd_spot,
+            r_eur=self.market.r_eur, r_usd=self.market.r_usd,
+            sigma_gold=self.market.sigma_gold, sigma_eurusd=self.market.sigma_eurusd,
+            rho=self.market.rho, gold_yield=self.market.gold_yield
+        )
 
-        greeks['delta_gold'] = (greeks['gold_up'] - greeks['gold_down']) / \
-                               (2 * bump_size * self.market.gold_spot)
-        greeks['gamma_gold'] = (greeks['gold_up'] - 2*base_price + greeks['gold_down']) / \
-                               (bump_size * self.market.gold_spot)**2
+        pricer_up = StructuredForwardPricer(market_up, self.contract)
+        pricer_down = StructuredForwardPricer(market_down, self.contract)
+
+        price_up = pricer_up.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+        price_down = pricer_down.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+
+        delta_gold = (price_up - price_down) / (2 * bump_size * self.market.gold_spot)
+        gamma_gold = (price_up - 2 * base_price + price_down) / (bump_size * self.market.gold_spot)**2
 
         # Delta (EUR/USD)
-        for direction, mult in [('up', 1), ('down', -1)]:
-            m = MarketData(
-                gold_spot=self.market.gold_spot,
-                eurusd_spot=self.market.eurusd_spot * (1 + mult * bump_size),
-                r_eur=self.market.r_eur, r_usd=self.market.r_usd,
-                sigma_gold=self.market.sigma_gold,
-                sigma_eurusd=self.market.sigma_eurusd,
-                rho=self.market.rho, gold_yield=self.market.gold_yield
-            )
-            p = StructuredForwardPricer(m, self.contract)
-            greeks[f'fx_{direction}'] = p.price_monte_carlo(n_paths, 252, seed)['price_zgroup']
+        market_up_fx = MarketData(
+            gold_spot=self.market.gold_spot,
+            eurusd_spot=self.market.eurusd_spot * (1 + bump_size),
+            r_eur=self.market.r_eur, r_usd=self.market.r_usd,
+            sigma_gold=self.market.sigma_gold, sigma_eurusd=self.market.sigma_eurusd,
+            rho=self.market.rho, gold_yield=self.market.gold_yield
+        )
+        market_down_fx = MarketData(
+            gold_spot=self.market.gold_spot,
+            eurusd_spot=self.market.eurusd_spot * (1 - bump_size),
+            r_eur=self.market.r_eur, r_usd=self.market.r_usd,
+            sigma_gold=self.market.sigma_gold, sigma_eurusd=self.market.sigma_eurusd,
+            rho=self.market.rho, gold_yield=self.market.gold_yield
+        )
 
-        greeks['delta_eurusd'] = (greeks['fx_up'] - greeks['fx_down']) / \
-                                 (2 * bump_size * self.market.eurusd_spot)
+        pricer_up_fx = StructuredForwardPricer(market_up_fx, self.contract)
+        pricer_down_fx = StructuredForwardPricer(market_down_fx, self.contract)
+
+        price_up_fx = pricer_up_fx.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+        price_down_fx = pricer_down_fx.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+
+        delta_eurusd = (price_up_fx - price_down_fx) / (2 * bump_size * self.market.eurusd_spot)
 
         # Vega (Gold volatility)
         vega_bump = 0.01
-        m_vega = MarketData(
+        market_vega_up = MarketData(
             gold_spot=self.market.gold_spot, eurusd_spot=self.market.eurusd_spot,
             r_eur=self.market.r_eur, r_usd=self.market.r_usd,
             sigma_gold=self.market.sigma_gold + vega_bump,
             sigma_eurusd=self.market.sigma_eurusd,
             rho=self.market.rho, gold_yield=self.market.gold_yield
         )
-        p_vega = StructuredForwardPricer(m_vega, self.contract)
-        greeks['vega_gold'] = (p_vega.price_monte_carlo(n_paths, 252, seed)['price_zgroup'] -
-                              base_price) / vega_bump
+        market_vega_down = MarketData(
+            gold_spot=self.market.gold_spot, eurusd_spot=self.market.eurusd_spot,
+            r_eur=self.market.r_eur, r_usd=self.market.r_usd,
+            sigma_gold=self.market.sigma_gold - vega_bump,
+            sigma_eurusd=self.market.sigma_eurusd,
+            rho=self.market.rho, gold_yield=self.market.gold_yield
+        )
+
+        pricer_vega_up = StructuredForwardPricer(market_vega_up, self.contract)
+        pricer_vega_down = StructuredForwardPricer(market_vega_down, self.contract)
+
+        price_vega_up = pricer_vega_up.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+        price_vega_down = pricer_vega_down.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+
+        vega_gold = (price_vega_up - price_vega_down) / (2 * vega_bump)
 
         # Rho (EUR rate)
-        rho_bump = 0.001
-        m_rho = MarketData(
+        rho_bump = 0.001  # 10 bps
+        market_rho_up = MarketData(
             gold_spot=self.market.gold_spot, eurusd_spot=self.market.eurusd_spot,
             r_eur=self.market.r_eur + rho_bump, r_usd=self.market.r_usd,
             sigma_gold=self.market.sigma_gold, sigma_eurusd=self.market.sigma_eurusd,
             rho=self.market.rho, gold_yield=self.market.gold_yield
         )
-        p_rho = StructuredForwardPricer(m_rho, self.contract)
-        greeks['rho_eur'] = (p_rho.price_monte_carlo(n_paths, 252, seed)['price_zgroup'] -
-                            base_price) / rho_bump
+
+        pricer_rho_up = StructuredForwardPricer(market_rho_up, self.contract)
+        price_rho_up = pricer_rho_up.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+
+        rho_eur = (price_rho_up - base_price) / rho_bump
+
+        # Correlation sensitivity
+        corr_bump = 0.05
+        market_corr_up = MarketData(
+            gold_spot=self.market.gold_spot, eurusd_spot=self.market.eurusd_spot,
+            r_eur=self.market.r_eur, r_usd=self.market.r_usd,
+            sigma_gold=self.market.sigma_gold, sigma_eurusd=self.market.sigma_eurusd,
+            rho=min(self.market.rho + corr_bump, 0.99), gold_yield=self.market.gold_yield
+        )
+        market_corr_down = MarketData(
+            gold_spot=self.market.gold_spot, eurusd_spot=self.market.eurusd_spot,
+            r_eur=self.market.r_eur, r_usd=self.market.r_usd,
+            sigma_gold=self.market.sigma_gold, sigma_eurusd=self.market.sigma_eurusd,
+            rho=max(self.market.rho - corr_bump, -0.99), gold_yield=self.market.gold_yield
+        )
+
+        pricer_corr_up = StructuredForwardPricer(market_corr_up, self.contract)
+        pricer_corr_down = StructuredForwardPricer(market_corr_down, self.contract)
+
+        price_corr_up = pricer_corr_up.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+        price_corr_down = pricer_corr_down.price_monte_carlo(n_paths, seed=seed)['price_zgroup']
+
+        corr_sensitivity = (price_corr_up - price_corr_down) / (2 * corr_bump)
 
         return {
-            'delta_gold': greeks['delta_gold'],
-            'gamma_gold': greeks['gamma_gold'],
-            'delta_eurusd': greeks['delta_eurusd'],
-            'vega_gold': greeks['vega_gold'],
-            'rho_eur': greeks['rho_eur']
+            'delta_gold': delta_gold,
+            'gamma_gold': gamma_gold,
+            'delta_eurusd': delta_eurusd,
+            'vega_gold': vega_gold,
+            'rho_eur': rho_eur,
+            'correlation_sensitivity': corr_sensitivity
         }
 
 
@@ -477,30 +920,28 @@ class StructuredForwardPricer:
 # =============================================================================
 
 def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
-                             n_paths: int = 50000) -> pd.DataFrame:
+                             n_paths: int = 50000, ranges=None) -> pd.DataFrame:
     """
-    Run comprehensive sensitivity analysis on key parameters.
-
-    Analyzes sensitivity to:
-        - Gold spot price
-        - EUR/USD spot rate
-        - Gold volatility
-        - EUR/USD volatility
-        - Correlation
+    Run comprehensive sensitivity analysis on key model parameters.
 
     Args:
         market: Base market data
         contract: Contract terms
         n_paths: Number of simulation paths
+        ranges: Optional SensitivityRangeGenerator for dynamic ranges
 
     Returns:
         DataFrame with sensitivity results
     """
+    if ranges is None:
+        ranges = SensitivityRangeGenerator(market, contract)
+
     results = []
 
-    # Gold spot sensitivity
+    # Gold spot sensitivity (dynamic range)
     print("  Analyzing gold spot sensitivity...")
-    for gs in np.linspace(4000, 5600, 9):
+    gold_spots = ranges.gold_spot_range(9)
+    for gs in gold_spots:
         m = MarketData(gold_spot=gs, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
                       sigma_gold=market.sigma_gold, sigma_eurusd=market.sigma_eurusd,
@@ -513,9 +954,10 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
             'knockout_rate': res['knockout_rate']
         })
 
-    # EUR/USD spot sensitivity
+    # EUR/USD spot sensitivity (barrier-bounded)
     print("  Analyzing EUR/USD spot sensitivity...")
-    for fx in np.linspace(1.06, 1.24, 10):
+    eurusd_spots = ranges.eurusd_spot_range(10)
+    for fx in eurusd_spots:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=fx,
                       r_eur=market.r_eur, r_usd=market.r_usd,
                       sigma_gold=market.sigma_gold, sigma_eurusd=market.sigma_eurusd,
@@ -528,9 +970,10 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
             'knockout_rate': res['knockout_rate']
         })
 
-    # Gold volatility sensitivity
+    # Gold volatility sensitivity (dynamic range)
     print("  Analyzing gold volatility sensitivity...")
-    for vol in np.linspace(0.15, 0.40, 6):
+    gold_vols = ranges.gold_vol_range(11)
+    for vol in gold_vols:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
                       sigma_gold=vol, sigma_eurusd=market.sigma_eurusd,
@@ -543,9 +986,26 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
             'knockout_rate': res['knockout_rate']
         })
 
-    # Correlation sensitivity
+    # EUR/USD volatility sensitivity (dynamic range)
+    print("  Analyzing EUR/USD volatility sensitivity...")
+    eurusd_vols = ranges.eurusd_vol_range(11)
+    for vol in eurusd_vols:
+        m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
+                      r_eur=market.r_eur, r_usd=market.r_usd,
+                      sigma_gold=market.sigma_gold, sigma_eurusd=vol,
+                      rho=market.rho, gold_yield=market.gold_yield)
+        pricer = StructuredForwardPricer(m, contract)
+        res = pricer.price_monte_carlo(n_paths, seed=42)
+        results.append({
+            'parameter': 'sigma_eurusd', 'value': vol,
+            'price_zgroup': res['price_zgroup'],
+            'knockout_rate': res['knockout_rate']
+        })
+
+    # Correlation sensitivity (dynamic range)
     print("  Analyzing correlation sensitivity...")
-    for rho in np.linspace(-0.6, 0.4, 6):
+    correlations = ranges.correlation_range(11)
+    for rho in correlations:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
                       sigma_gold=market.sigma_gold, sigma_eurusd=market.sigma_eurusd,
@@ -562,102 +1022,768 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
 
 
 # =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def create_visualizations(pricing_result: Dict, sensitivity_df: pd.DataFrame,
+                          greeks: Dict, contract: ContractTerms,
+                          output_dir: str = 'output', market: MarketData = None):
+    """
+    Generate all visualizations for the product proposal.
+
+    Creates:
+    1. Monte Carlo simulation paths
+    2. Payoff distribution
+    3. Sensitivity analysis charts
+    4. Knockout analysis
+    5. Payoff diagram
+    6. Greeks summary
+
+    Args:
+        pricing_result: Monte Carlo pricing results
+        sensitivity_df: Sensitivity analysis DataFrame
+        greeks: Greeks dictionary
+        contract: Contract terms
+        output_dir: Output directory for figures
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    plt.style.use('seaborn-v0_8-whitegrid')
+
+    times = np.linspace(0, contract.tenor, pricing_result['gold_paths'].shape[1])
+
+    # 1. Monte Carlo Paths
+    print("  Generating Monte Carlo paths figure...")
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+    knocked_out = pricing_result['knocked_out']
+    gold_paths = pricing_result['gold_paths']
+    eurusd_paths = pricing_result['eurusd_paths']
+
+    n_display = 50
+    ko_idx = np.where(knocked_out)[0][:n_display//2]
+    surv_idx = np.where(~knocked_out)[0][:n_display//2]
+    sample_idx = np.concatenate([ko_idx, surv_idx])
+
+    # Gold paths
+    ax1 = axes[0]
+    for i in sample_idx:
+        color = 'red' if knocked_out[i] else 'blue'
+        alpha = 0.3 if knocked_out[i] else 0.5
+        ax1.plot(times, gold_paths[i], color=color, alpha=alpha, linewidth=0.5)
+    ax1.axhline(y=contract.strike, color='green', linestyle='--', linewidth=2)
+    ax1.set_xlabel('Time (Years)')
+    ax1.set_ylabel('Gold Price (USD/oz)')
+    ax1.set_title('Gold Price Paths - Monte Carlo Simulation')
+
+    # EUR/USD paths
+    ax2 = axes[1]
+    for i in sample_idx:
+        color = 'red' if knocked_out[i] else 'blue'
+        alpha = 0.3 if knocked_out[i] else 0.5
+        ax2.plot(times, eurusd_paths[i], color=color, alpha=alpha, linewidth=0.5)
+    ax2.axhline(y=contract.barrier_lower, color='darkred', linestyle='--', linewidth=2)
+    ax2.axhline(y=contract.barrier_upper, color='darkred', linestyle='--', linewidth=2)
+    ax2.fill_between(times, contract.barrier_lower, contract.barrier_upper,
+                     color='green', alpha=0.1)
+    ax2.set_xlabel('Time (Years)')
+    ax2.set_ylabel('EUR/USD Exchange Rate')
+    ax2.set_title('EUR/USD Paths with Double Knock-Out Barriers')
+
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/monte_carlo_paths.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 2. Payoff Distribution
+    print("  Generating payoff distribution figure...")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    settlement_prices = pricing_result['settlement_prices']
+    payoffs = contract.notional * (settlement_prices - contract.strike) / contract.strike
+
+    ax1 = axes[0]
+    ax1.hist(payoffs[~knocked_out] / 1e6, bins=50, alpha=0.7, color='blue',
+            label='Surviving Paths', density=True)
+    ax1.hist(payoffs[knocked_out] / 1e6, bins=50, alpha=0.7, color='red',
+            label='Knocked Out Paths', density=True)
+    ax1.axvline(x=np.mean(payoffs) / 1e6, color='black', linestyle='--', linewidth=2)
+    ax1.set_xlabel('Payoff (EUR Millions)')
+    ax1.set_ylabel('Density')
+    ax1.set_title('Distribution of Z Group Payoffs')
+    ax1.legend()
+
+    ax2 = axes[1]
+    ax2.hist(settlement_prices[~knocked_out], bins=50, alpha=0.7, color='blue',
+            label='Surviving', density=True)
+    ax2.hist(settlement_prices[knocked_out], bins=50, alpha=0.7, color='red',
+            label='Knocked Out', density=True)
+    ax2.axvline(x=contract.strike, color='green', linestyle='--', linewidth=2)
+    ax2.set_xlabel('Gold Price at Settlement (USD/oz)')
+    ax2.set_ylabel('Density')
+    ax2.set_title('Distribution of Settlement Prices')
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/payoff_distribution.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 3. Payoff Diagram (dynamic range)
+    print("  Generating payoff diagram...")
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    if market is not None:
+        rgen = SensitivityRangeGenerator(market, contract)
+        payoff_lo, payoff_hi = rgen.payoff_diagram_range()
+    else:
+        spread = contract.strike * 0.3
+        payoff_lo, payoff_hi = contract.strike - spread, contract.strike + spread
+    gold_prices = np.linspace(payoff_lo, payoff_hi, 200)
+    zgroup_payoff = contract.notional * (gold_prices - contract.strike) / contract.strike
+    abank_payoff = -zgroup_payoff
+
+    ax.plot(gold_prices, zgroup_payoff / 1e6, 'b-', linewidth=2.5, label='Z Group Payoff')
+    ax.plot(gold_prices, abank_payoff / 1e6, 'r-', linewidth=2.5, label='A Bank Payoff')
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax.axvline(x=contract.strike, color='green', linestyle='--', linewidth=2,
+              label=f'Strike K = ${contract.strike:,.0f}')
+    ax.fill_between(gold_prices, 0, zgroup_payoff / 1e6,
+                   where=(zgroup_payoff > 0), alpha=0.3, color='blue')
+    ax.fill_between(gold_prices, 0, zgroup_payoff / 1e6,
+                   where=(zgroup_payoff < 0), alpha=0.3, color='red')
+
+    ax.set_xlabel('Gold Spot Price at Settlement (USD/oz)', fontsize=12)
+    ax.set_ylabel('Payoff (EUR Millions)', fontsize=12)
+    ax.set_title(f'Payoff Diagram: Structured Gold Forward\n'
+                f'Notional = EUR {contract.notional/1e6:.0f}M, Strike = ${contract.strike:,.0f}/oz',
+                fontsize=14)
+    ax.legend(loc='upper left', fontsize=11)
+
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/payoff_diagram.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 4. Sensitivity Analysis
+    print("  Generating sensitivity analysis figure...")
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    axes = axes.flatten()
+
+    parameters = sensitivity_df['parameter'].unique()
+    param_labels = {
+        'gold_spot': 'Gold Spot ($/oz)',
+        'eurusd_spot': 'EUR/USD Spot',
+        'sigma_gold': 'Gold Volatility',
+        'sigma_eurusd': 'EUR/USD Volatility',
+        'correlation': 'Correlation (rho)'
+    }
+
+    for i, param in enumerate(parameters):
+        if i >= len(axes) - 1:
+            break
+        ax = axes[i]
+        data = sensitivity_df[sensitivity_df['parameter'] == param]
+
+        ax.plot(data['value'], data['price_zgroup'] / 1e6, 'b-o', linewidth=2, markersize=6)
+        ax.set_ylabel('Z Group PV (EUR Millions)', color='blue')
+        ax.tick_params(axis='y', labelcolor='blue')
+
+        ax2 = ax.twinx()
+        ax2.plot(data['value'], data['knockout_rate'] * 100, 'r--s', linewidth=2, markersize=6)
+        ax2.set_ylabel('Knockout Rate (%)', color='red')
+        ax2.tick_params(axis='y', labelcolor='red')
+
+        ax.set_xlabel(param_labels.get(param, param))
+        ax.set_title(f'Sensitivity to {param_labels.get(param, param)}')
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/sensitivity_analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 5. Greeks Summary
+    print("  Generating Greeks summary figure...")
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    greek_names = ['Delta\n(Gold)', 'Gamma\n(Gold)', 'Delta\n(EUR/USD)',
+                  'Vega\n(Gold)', 'Rho\n(EUR)', 'Corr\nSensitivity']
+    greek_values = [
+        greeks['delta_gold'] / 1e6,
+        greeks['gamma_gold'] / 1e6,
+        greeks['delta_eurusd'] / 1e6,
+        greeks['vega_gold'] / 1e6,
+        greeks['rho_eur'] / 1e6,
+        greeks['correlation_sensitivity'] / 1e6
+    ]
+
+    colors = ['blue' if v >= 0 else 'red' for v in greek_values]
+    bars = ax.bar(greek_names, greek_values, color=colors, alpha=0.7, edgecolor='black')
+
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax.set_ylabel('Sensitivity (EUR Millions per unit)', fontsize=12)
+    ax.set_title('Risk Sensitivities (Greeks) Summary', fontsize=14)
+
+    for bar, val in zip(bars, greek_values):
+        height = bar.get_height()
+        ax.annotate(f'EUR {val:.2f}M',
+                   xy=(bar.get_x() + bar.get_width() / 2, height),
+                   xytext=(0, 3 if height >= 0 else -15),
+                   textcoords="offset points",
+                   ha='center', va='bottom' if height >= 0 else 'top',
+                   fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/greeks_summary.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print("  All visualizations generated successfully!")
+
+
+# =============================================================================
+# EXCEL OUTPUT GENERATION
+# =============================================================================
+
+def generate_excel_output(pricing_result: Dict, sensitivity_df: pd.DataFrame,
+                          greeks: Dict, market: MarketData, contract: ContractTerms,
+                          output_path: str, provider=None):
+    """
+    Generate comprehensive Excel file with all analysis data.
+
+    Sheets:
+    1. Market Data - Input parameters
+    2. Contract Terms - Product specifications
+    3. Pricing Results - Monte Carlo results
+    4. Greeks - Risk sensitivities
+    5. Sensitivity Analysis - Parameter sensitivity
+    6. Path Statistics - Simulation statistics
+    7. Sample Paths - Sample of individual path data
+
+    Args:
+        pricing_result: Monte Carlo results
+        sensitivity_df: Sensitivity analysis data
+        greeks: Greek values
+        market: Market parameters
+        contract: Contract terms
+        output_path: Excel file path
+    """
+    print("\nGenerating Excel output...")
+
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+
+        # Sheet 1: Market Data
+        market_params = pd.DataFrame({
+            'Parameter': [
+                'Gold Spot Price (USD/oz)',
+                'EUR/USD Spot Rate',
+                'EUR Risk-Free Rate (%)',
+                'USD Risk-Free Rate (%)',
+                'Gold Volatility (%)',
+                'EUR/USD Volatility (%)',
+                'Correlation',
+                'Gold Convenience Yield (%)'
+            ],
+            'Value': [
+                market.gold_spot,
+                market.eurusd_spot,
+                market.r_eur * 100,
+                market.r_usd * 100,
+                market.sigma_gold * 100,
+                market.sigma_eurusd * 100,
+                market.rho,
+                market.gold_yield * 100
+            ]
+        })
+        market_params.to_excel(writer, sheet_name='Market Data', index=False)
+
+        # Sheet 2: Contract Terms
+        contract_terms = pd.DataFrame({
+            'Parameter': [
+                'Notional Principal (EUR)',
+                'Strike Price (USD/oz)',
+                'Tenor (Years)',
+                'Lower Barrier (EUR/USD)',
+                'Upper Barrier (EUR/USD)',
+                'Start Date',
+                'End Date'
+            ],
+            'Value': [
+                contract.notional,
+                contract.strike,
+                contract.tenor,
+                contract.barrier_lower,
+                contract.barrier_upper,
+                'March 1, 2026',
+                'February 28, 2028'
+            ]
+        })
+        contract_terms.to_excel(writer, sheet_name='Contract Terms', index=False)
+
+        # Sheet 3: Pricing Results
+        pricing_summary = pd.DataFrame({
+            'Metric': [
+                'Z Group Present Value (EUR)',
+                'A Bank Present Value (EUR)',
+                'Standard Error (EUR)',
+                '95% CI Lower (EUR)',
+                '95% CI Upper (EUR)',
+                'Knockout Rate (%)',
+                'Average Knockout Time (Years)',
+                'Lower Barrier Breach Rate (%)',
+                'Upper Barrier Breach Rate (%)',
+                'Number of Simulation Paths',
+                'Number of Time Steps'
+            ],
+            'Value': [
+                pricing_result['price_zgroup'],
+                pricing_result['price_abank'],
+                pricing_result['std_error'],
+                pricing_result['ci_95_lower'],
+                pricing_result['ci_95_upper'],
+                pricing_result['knockout_rate'] * 100,
+                pricing_result['avg_knockout_time'] if not np.isnan(pricing_result['avg_knockout_time']) else 'N/A',
+                pricing_result['lower_breach_rate'] * 100,
+                pricing_result['upper_breach_rate'] * 100,
+                pricing_result['n_paths'],
+                pricing_result['n_steps']
+            ]
+        })
+        pricing_summary.to_excel(writer, sheet_name='Pricing Results', index=False)
+
+        # Sheet 4: Greeks
+        greeks_df = pd.DataFrame({
+            'Greek': [
+                'Delta (Gold)',
+                'Gamma (Gold)',
+                'Delta (EUR/USD)',
+                'Vega (Gold)',
+                'Rho (EUR Rate)',
+                'Correlation Sensitivity'
+            ],
+            'Value (EUR)': [
+                greeks['delta_gold'],
+                greeks['gamma_gold'],
+                greeks['delta_eurusd'],
+                greeks['vega_gold'],
+                greeks['rho_eur'],
+                greeks['correlation_sensitivity']
+            ],
+            'Description': [
+                'Change in value per $1 change in gold price',
+                'Second derivative with respect to gold price',
+                'Change in value per 0.01 change in EUR/USD',
+                'Change in value per 1% change in gold volatility',
+                'Change in value per 1bp change in EUR rate',
+                'Change in value per 0.05 change in correlation'
+            ]
+        })
+        greeks_df.to_excel(writer, sheet_name='Greeks', index=False)
+
+        # Sheet 5: Sensitivity Analysis
+        sensitivity_df.to_excel(writer, sheet_name='Sensitivity Analysis', index=False)
+
+        # Sheet 6: Path Statistics
+        settlement_prices = pricing_result['settlement_prices']
+        settlement_times = pricing_result['settlement_times']
+        knocked_out = pricing_result['knocked_out']
+
+        path_stats = pd.DataFrame({
+            'Statistic': [
+                'Mean Settlement Price (USD/oz)',
+                'Std Dev Settlement Price',
+                'Min Settlement Price',
+                'Max Settlement Price',
+                'Mean Settlement Time (Years)',
+                'Total Paths',
+                'Knocked Out Paths',
+                'Surviving Paths'
+            ],
+            'Value': [
+                np.mean(settlement_prices),
+                np.std(settlement_prices),
+                np.min(settlement_prices),
+                np.max(settlement_prices),
+                np.mean(settlement_times),
+                len(knocked_out),
+                np.sum(knocked_out),
+                np.sum(~knocked_out)
+            ]
+        })
+        path_stats.to_excel(writer, sheet_name='Path Statistics', index=False)
+
+        # Sheet 7: Sample Paths
+        n_sample = min(1000, len(settlement_prices))
+        np.random.seed(42)
+        sample_idx = np.random.choice(len(settlement_prices), n_sample, replace=False)
+        sample_data = pd.DataFrame({
+            'Path_ID': sample_idx,
+            'Settlement_Price_USD': settlement_prices[sample_idx],
+            'Settlement_Time_Years': settlement_times[sample_idx],
+            'Knocked_Out': knocked_out[sample_idx],
+            'Payoff_ZGroup_EUR': contract.notional * (settlement_prices[sample_idx] - contract.strike) / contract.strike
+        })
+        sample_data.to_excel(writer, sheet_name='Sample Paths', index=False)
+
+        # Sheet 8: Data Provenance
+        if provider is not None:
+            prov_df = provider.get_provenance_dataframe()
+            prov_df.to_excel(writer, sheet_name='Data Provenance', index=False)
+
+    print(f"Excel file saved to: {output_path}")
+
+
+# =============================================================================
+# VALIDATION AND CONVERGENCE ANALYSIS
+# =============================================================================
+
+def validate_inputs(market: MarketData, contract: ContractTerms) -> list:
+    """
+    Validate market data and contract terms for reasonableness.
+
+    Returns list of warnings/errors. Empty list means all inputs valid.
+    """
+    issues = []
+
+    # Spot prices must be positive
+    if market.gold_spot <= 0:
+        issues.append(f"ERROR: Gold spot must be positive, got {market.gold_spot}")
+    if market.eurusd_spot <= 0:
+        issues.append(f"ERROR: EUR/USD spot must be positive, got {market.eurusd_spot}")
+
+    # Volatilities: positive and reasonable
+    if not 0 < market.sigma_gold < 1.0:
+        issues.append(f"WARNING: Gold volatility {market.sigma_gold*100:.1f}% outside typical range")
+    if not 0 < market.sigma_eurusd < 0.5:
+        issues.append(f"WARNING: EUR/USD volatility {market.sigma_eurusd*100:.1f}% outside typical range")
+
+    # Correlation in [-1, 1]
+    if not -1 <= market.rho <= 1:
+        issues.append(f"ERROR: Correlation must be in [-1,1], got {market.rho}")
+
+    # Check strike vs forward price
+    forward_price = market.gold_spot * np.exp(
+        (market.r_usd - market.gold_yield) * contract.tenor
+    )
+    strike_ratio = contract.strike / forward_price
+    if strike_ratio > 1.3:
+        issues.append(f"NOTE: Strike ${contract.strike:,.0f} is {(strike_ratio-1)*100:.0f}% above "
+                     f"forward ${forward_price:,.0f} (deep OTM for Z Group)")
+
+    # Check barrier proximity
+    if not contract.barrier_lower < market.eurusd_spot < contract.barrier_upper:
+        issues.append(f"ERROR: Spot {market.eurusd_spot} outside barrier range!")
+
+    lower_dist = (market.eurusd_spot - contract.barrier_lower) / market.eurusd_spot
+    if lower_dist < 0.05:
+        issues.append(f"NOTE: Lower barrier only {lower_dist*100:.1f}% from spot (high KO probability)")
+
+    return issues
+
+
+def compute_analytical_benchmarks(market: MarketData, contract: ContractTerms) -> dict:
+    """
+    Compute analytical benchmarks for model validation.
+
+    The vanilla forward (no barriers) has a known price - useful for sanity checks.
+    Includes quanto adjustment calculation.
+    """
+    # Quanto adjustment: -ρ × σ_S × σ_X
+    # With negative correlation, this is positive (increases gold drift under EUR measure)
+    quanto_adjustment = market.rho * market.sigma_gold * market.sigma_eurusd
+    drift_without_quanto = market.r_usd - market.gold_yield
+    drift_with_quanto = drift_without_quanto - quanto_adjustment
+
+    # Gold forward price (standard, without quanto)
+    gold_forward = market.gold_spot * np.exp(
+        drift_without_quanto * contract.tenor
+    )
+
+    # Gold forward under EUR measure (with quanto adjustment)
+    gold_forward_quanto = market.gold_spot * np.exp(
+        drift_with_quanto * contract.tenor
+    )
+
+    # EUR/USD forward (interest rate parity)
+    eurusd_forward = market.eurusd_spot * np.exp(
+        (market.r_eur - market.r_usd) * contract.tenor
+    )
+
+    # Vanilla forward PV (no barriers) - with quanto adjustment
+    vanilla_pv = np.exp(-market.r_eur * contract.tenor) * \
+                 contract.notional * (gold_forward_quanto - contract.strike) / contract.strike
+
+    return {
+        'gold_forward': gold_forward,
+        'gold_forward_quanto': gold_forward_quanto,
+        'eurusd_forward': eurusd_forward,
+        'vanilla_forward_pv': vanilla_pv,
+        'moneyness': gold_forward / contract.strike,
+        'quanto_adjustment': quanto_adjustment,
+        'drift_without_quanto': drift_without_quanto,
+        'drift_with_quanto': drift_with_quanto
+    }
+
+
+def run_convergence_test(pricer, path_counts: list = None) -> pd.DataFrame:
+    """
+    Test Monte Carlo convergence across different path counts.
+
+    Validates that estimates stabilize as paths increase.
+    """
+    if path_counts is None:
+        path_counts = [5000, 10000, 25000, 50000, 100000]
+
+    results = []
+    for n in path_counts:
+        res = pricer.price_monte_carlo(n_paths=n, n_steps=504, seed=42)
+        results.append({
+            'paths': n,
+            'price': res['price_zgroup'],
+            'std_error': res['std_error'],
+            'ko_rate': res['knockout_rate']
+        })
+
+    return pd.DataFrame(results)
+
+
+def plot_convergence_analysis(conv_df: pd.DataFrame, output_dir: str):
+    """Generate convergence analysis plot."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Price convergence with CI
+    ax1 = axes[0]
+    ax1.errorbar(conv_df['paths'], conv_df['price'] / 1e6,
+                yerr=1.96 * conv_df['std_error'] / 1e6,
+                fmt='b-o', linewidth=2, markersize=6, capsize=4)
+    ax1.set_xscale('log')
+    ax1.set_xlabel('Number of Paths')
+    ax1.set_ylabel('Price (EUR Millions)')
+    ax1.set_title('Monte Carlo Convergence')
+    ax1.grid(True, alpha=0.3)
+
+    # Standard error decay
+    ax2 = axes[1]
+    ax2.plot(conv_df['paths'], conv_df['std_error'] / 1e6, 'r-o', linewidth=2, markersize=6)
+    ax2.set_xscale('log')
+    ax2.set_yscale('log')
+    ax2.set_xlabel('Number of Paths')
+    ax2.set_ylabel('Standard Error (EUR Millions)')
+    ax2.set_title('Standard Error Decay (should be ~1/√n)')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/convergence_analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 
 def main():
     """
-    Main execution function - runs complete pricing analysis.
+    Main execution function for GAAIF Challenge submission.
+
+    Executes complete analysis pipeline:
+    1. Initialize market data and contract terms
+    2. Run Monte Carlo pricing
+    3. Compute Greeks
+    4. Run sensitivity analysis
+    5. Generate visualizations
+    6. Export Excel data file
     """
     print("=" * 70)
-    print("GAAIF CHALLENGE - STRUCTURED GOLD FORWARD PRICING MODEL")
+    print("GAAIF CHALLENGE - STRUCTURED FORWARD PRICING MODEL")
     print("=" * 70)
+    print(f"Execution Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Initialize market data and contract
-    market = MarketData()
-    contract = ContractTerms()
+    # Create output directory
+    output_dir = 'output'
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Display parameters
+    # Initialize market data via provider (live fetch with fallback)
     print("\n" + "-" * 70)
-    print("MARKET DATA (February 1, 2026)")
+    print("INITIALIZING MARKET DATA")
     print("-" * 70)
-    print(f"  Gold Spot Price:     ${market.gold_spot:,.2f}/oz")
-    print(f"  EUR/USD Spot:        {market.eurusd_spot:.4f}")
-    print(f"  EUR Risk-Free Rate:  {market.r_eur*100:.2f}%")
-    print(f"  USD Risk-Free Rate:  {market.r_usd*100:.2f}%")
-    print(f"  Gold Volatility:     {market.sigma_gold*100:.1f}%")
-    print(f"  EUR/USD Volatility:  {market.sigma_eurusd*100:.1f}%")
-    print(f"  Correlation:         {market.rho:.2f}")
 
+    provider = MarketDataProvider(use_live=True)
+    market = provider.fetch_market_data()
+
+    contract = ContractTerms(
+        notional=500_000_000,
+        strike=4600.0,
+        tenor=2.0,
+        barrier_lower=1.05,
+        barrier_upper=1.25
+    )
+
+    # Print provenance report
+    print(provider.get_provenance_report())
+
+    # Create dynamic sensitivity ranges
+    ranges = SensitivityRangeGenerator(market, contract)
+
+    print(f"\nMarket Parameters:")
+    print(f"  Gold Spot:        ${market.gold_spot:,.2f}/oz")
+    print(f"  EUR/USD Spot:     {market.eurusd_spot:.4f}")
+    print(f"  EUR Rate:         {market.r_eur*100:.2f}%")
+    print(f"  USD Rate:         {market.r_usd*100:.2f}%")
+    print(f"  Gold Vol:         {market.sigma_gold*100:.1f}%")
+    print(f"  EUR/USD Vol:      {market.sigma_eurusd*100:.1f}%")
+    print(f"  Correlation:      {market.rho:.2f}")
+
+    print(f"\nContract Terms:")
+    print(f"  Notional:         EUR {contract.notional/1e6:,.0f}M")
+    print(f"  Strike:           ${contract.strike:,.2f}/oz")
+    print(f"  Tenor:            {contract.tenor} years")
+    print(f"  Barriers:         [{contract.barrier_lower}, {contract.barrier_upper}]")
+
+    # Input Validation
     print("\n" + "-" * 70)
-    print("CONTRACT TERMS")
+    print("INPUT VALIDATION")
     print("-" * 70)
-    print(f"  Notional:            EUR {contract.notional/1e6:,.0f} Million")
-    print(f"  Strike Price (K):    ${contract.strike:,.2f}/oz")
-    print(f"  Tenor:               {contract.tenor} years")
-    print(f"  Lower Barrier:       EUR/USD {contract.barrier_lower}")
-    print(f"  Upper Barrier:       EUR/USD {contract.barrier_upper}")
 
-    # Current intrinsic value
-    intrinsic = contract.notional * (market.gold_spot - contract.strike) / contract.strike
-    print(f"\n  Current Intrinsic:   EUR {intrinsic/1e6:,.2f} Million")
+    issues = validate_inputs(market, contract)
+    if issues:
+        for issue in issues:
+            print(f"  {issue}")
+    else:
+        print("  All inputs validated successfully.")
+
+    # Analytical Benchmarks
+    print("\n" + "-" * 70)
+    print("ANALYTICAL BENCHMARKS")
+    print("-" * 70)
+
+    benchmarks = compute_analytical_benchmarks(market, contract)
+    print(f"  Gold 2Y Forward:       ${benchmarks['gold_forward']:,.0f}/oz")
+    print(f"  Gold Forward (Quanto): ${benchmarks['gold_forward_quanto']:,.0f}/oz")
+    print(f"  EUR/USD 2Y Forward:    {benchmarks['eurusd_forward']:.4f}")
+    print(f"  Vanilla Forward PV:    EUR {benchmarks['vanilla_forward_pv']:,.0f}")
+    print(f"  Moneyness (F/K):       {benchmarks['moneyness']:.1%}")
+    print(f"\nQuanto Adjustment Details:")
+    print(f"  Adjustment term:       {benchmarks['quanto_adjustment']*100:.3f}% (ρ × σ_S × σ_X)")
+    print(f"  Drift w/o quanto:      {benchmarks['drift_without_quanto']*100:.2f}%")
+    print(f"  Drift w/ quanto:       {benchmarks['drift_with_quanto']*100:.2f}%")
+    print(f"  Impact on forward:     ${benchmarks['gold_forward_quanto'] - benchmarks['gold_forward']:,.0f}/oz")
 
     # Monte Carlo Pricing
     print("\n" + "-" * 70)
     print("MONTE CARLO PRICING")
     print("-" * 70)
-    print("Running simulation (100,000 paths, 504 time steps)...")
 
     pricer = StructuredForwardPricer(market, contract)
-    result = pricer.price_monte_carlo(n_paths=100000, n_steps=504, seed=42)
 
-    print(f"\n  Z Group Present Value:  EUR {result['price_zgroup']/1e6:,.2f} Million")
-    print(f"  A Bank Present Value:   EUR {result['price_abank']/1e6:,.2f} Million")
-    print(f"  Standard Error:         EUR {result['std_error']/1e6:,.4f} Million")
-    print(f"  95% Confidence Interval: [{result['ci_95_lower']/1e6:,.2f}M, "
-          f"{result['ci_95_upper']/1e6:,.2f}M]")
+    print("\nRunning Monte Carlo simulation (100,000 paths, 504 steps)...")
+    pricing_result = pricer.price_monte_carlo(
+        n_paths=100000,
+        n_steps=504,
+        seed=42,
+        antithetic=True,
+        control_variate=True
+    )
 
-    print(f"\n  Knockout Rate:          {result['knockout_rate']*100:.2f}%")
-    print(f"  Avg Knockout Time:      {result['avg_knockout_time']:.2f} years")
-    print(f"  Lower Barrier Breaches: {result['lower_breach_rate']*100:.2f}%")
-    print(f"  Upper Barrier Breaches: {result['upper_breach_rate']*100:.2f}%")
+    print(f"\nPricing Results:")
+    print(f"  Z Group PV:       EUR {pricing_result['price_zgroup']:,.2f}")
+    print(f"  A Bank PV:        EUR {pricing_result['price_abank']:,.2f}")
+    print(f"  Std Error:        EUR {pricing_result['std_error']:,.2f}")
+    print(f"  95% CI:           [{pricing_result['ci_95_lower']:,.2f}, {pricing_result['ci_95_upper']:,.2f}]")
+    print(f"\nBarrier Analysis:")
+    print(f"  Knockout Rate:    {pricing_result['knockout_rate']*100:.2f}%")
+    if not np.isnan(pricing_result['avg_knockout_time']):
+        print(f"  Avg KO Time:      {pricing_result['avg_knockout_time']:.2f} years")
+    print(f"  Lower Breach:     {pricing_result['lower_breach_rate']*100:.2f}%")
+    print(f"  Upper Breach:     {pricing_result['upper_breach_rate']*100:.2f}%")
+
+    # Convergence Analysis
+    print("\n" + "-" * 70)
+    print("CONVERGENCE ANALYSIS")
+    print("-" * 70)
+
+    print("\nTesting Monte Carlo convergence...")
+    conv_df = run_convergence_test(pricer, path_counts=[5000, 10000, 25000, 50000, 100000])
+    print(f"\n  {'Paths':>10} {'Price (EUR)':>18} {'Std Error':>14} {'KO Rate':>10}")
+    print("  " + "-" * 56)
+    for _, row in conv_df.iterrows():
+        print(f"  {row['paths']:>10,} {row['price']:>18,.0f} {row['std_error']:>14,.0f} {row['ko_rate']*100:>9.1f}%")
+
+    print("\n  Generating convergence plot...")
+    plot_convergence_analysis(conv_df, output_dir)
 
     # Greeks
     print("\n" + "-" * 70)
-    print("RISK SENSITIVITIES (GREEKS)")
+    print("COMPUTING GREEKS")
     print("-" * 70)
-    print("Computing Greeks (50,000 paths)...")
 
-    greeks = pricer.compute_greeks(n_paths=50000, seed=42)
+    greeks = pricer.compute_greeks(pricing_result, n_paths=50000, seed=42)
 
-    print(f"\n  Delta (Gold):        EUR {greeks['delta_gold']:,.0f} per $1 gold")
-    print(f"  Gamma (Gold):        EUR {greeks['gamma_gold']:,.2f}")
-    print(f"  Delta (EUR/USD):     EUR {greeks['delta_eurusd']/1e6:,.2f}M per 0.01 FX")
-    print(f"  Vega (Gold Vol):     EUR {greeks['vega_gold']/1e6:,.2f}M per 1% vol")
-    print(f"  Rho (EUR Rate):      EUR {greeks['rho_eur']/1e6:,.2f}M per 1bp")
+    print(f"\nRisk Sensitivities:")
+    print(f"  Delta (Gold):     EUR {greeks['delta_gold']:,.2f} per $1")
+    print(f"  Gamma (Gold):     EUR {greeks['gamma_gold']:,.2f}")
+    print(f"  Delta (EUR/USD):  EUR {greeks['delta_eurusd']:,.2f} per 0.01")
+    print(f"  Vega (Gold):      EUR {greeks['vega_gold']:,.2f} per 1% vol")
+    print(f"  Rho (EUR):        EUR {greeks['rho_eur']:,.2f} per 1bp")
+    print(f"  Corr Sens:        EUR {greeks['correlation_sensitivity']:,.2f} per 0.05")
 
     # Sensitivity Analysis
     print("\n" + "-" * 70)
     print("SENSITIVITY ANALYSIS")
     print("-" * 70)
 
-    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=30000)
+    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=50000, ranges=ranges)
 
-    print("\n  Gold Spot Sensitivity:")
-    gold_sens = sensitivity_df[sensitivity_df['parameter'] == 'gold_spot']
-    for _, row in gold_sens.iterrows():
-        print(f"    ${row['value']:,.0f}: EUR {row['price_zgroup']/1e6:+,.1f}M")
+    # Visualizations
+    print("\n" + "-" * 70)
+    print("GENERATING VISUALIZATIONS")
+    print("-" * 70)
 
+    create_visualizations(pricing_result, sensitivity_df, greeks, contract, output_dir, market=market)
+
+    # Excel Output
+    print("\n" + "-" * 70)
+    print("GENERATING EXCEL OUTPUT")
+    print("-" * 70)
+
+    generate_excel_output(
+        pricing_result, sensitivity_df, greeks,
+        market, contract,
+        f'{output_dir}/GAAIF_Analysis_Data.xlsx',
+        provider=provider
+    )
+
+    # Quanto Impact Analysis
+    print("\n" + "-" * 70)
+    print("QUANTO ADJUSTMENT IMPACT")
+    print("-" * 70)
+
+    print("\nComparing pricing with vs without quanto adjustment...")
+    result_no_quanto = pricer.price_monte_carlo(
+        n_paths=100000, n_steps=504, seed=42,
+        use_quanto_adjustment=False
+    )
+    quanto_impact = pricing_result['price_zgroup'] - result_no_quanto['price_zgroup']
+    print(f"  Price WITH quanto:     EUR {pricing_result['price_zgroup']:,.0f}")
+    print(f"  Price WITHOUT quanto:  EUR {result_no_quanto['price_zgroup']:,.0f}")
+    print(f"  Quanto Impact:         EUR {quanto_impact:,.0f}")
+    print(f"  Impact as % of PV:     {quanto_impact/abs(pricing_result['price_zgroup'])*100:.2f}%")
+
+    # Summary
     print("\n" + "=" * 70)
     print("ANALYSIS COMPLETE")
     print("=" * 70)
+    print("\nOutput files generated:")
+    print(f"  - {output_dir}/GAAIF_Analysis_Data.xlsx")
+    print(f"  - {output_dir}/convergence_analysis.png")
+    print(f"  - {output_dir}/monte_carlo_paths.png")
+    print(f"  - {output_dir}/payoff_distribution.png")
+    print(f"  - {output_dir}/payoff_diagram.png")
+    print(f"  - {output_dir}/sensitivity_analysis.png")
+    print(f"  - {output_dir}/greeks_summary.png")
 
     return {
-        'market': market,
-        'contract': contract,
-        'pricing_result': result,
+        'pricing_result': pricing_result,
         'greeks': greeks,
-        'sensitivity': sensitivity_df
+        'sensitivity_df': sensitivity_df,
+        'benchmarks': benchmarks,
+        'quanto_impact': quanto_impact
     }
 
 

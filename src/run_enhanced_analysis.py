@@ -27,6 +27,7 @@ from advanced_models import (
     HestonParams, JumpParams
 )
 from visualization import ProductVisualizer
+from market_data import MarketDataProvider, SensitivityRangeGenerator
 
 
 def create_scenario_visualizations(scenario_df: pd.DataFrame, output_dir: str):
@@ -144,7 +145,8 @@ def create_model_comparison_chart(model_results: dict, output_dir: str):
 
 
 def generate_enhanced_excel(pricing_result, scenario_df, model_results,
-                           greeks, market, contract, output_path):
+                           greeks, market, contract, output_path,
+                           provider=None):
     """Generate comprehensive Excel with all analysis."""
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
@@ -247,6 +249,11 @@ def generate_enhanced_excel(pricing_result, scenario_df, model_results,
         ])
         model_df.to_excel(writer, sheet_name='Model Comparison', index=False)
 
+        # Sheet 7: Data Provenance
+        if provider is not None:
+            prov_df = provider.get_provenance_dataframe()
+            prov_df.to_excel(writer, sheet_name='Data Provenance', index=False)
+
     print(f"Enhanced Excel saved to: {output_path}")
 
 
@@ -261,9 +268,16 @@ def main():
     output_dir = '../output'
     os.makedirs(output_dir, exist_ok=True)
 
-    # Initialize
-    market = MarketData()
+    # Initialize via provider (live data with fallback)
+    provider = MarketDataProvider(use_live=True)
+    market = provider.fetch_market_data()
     contract = ContractTerms()
+
+    # Print provenance report
+    print(provider.get_provenance_report())
+
+    # Create dynamic sensitivity ranges
+    ranges = SensitivityRangeGenerator(market, contract)
 
     print("\n" + "-" * 70)
     print("1. BASE CASE PRICING")
@@ -283,7 +297,7 @@ def main():
     print("2. SCENARIO ANALYSIS")
     print("-" * 70)
 
-    scenario_df = run_scenario_analysis(market, contract, n_paths=30000)
+    scenario_df = run_scenario_analysis(market, contract, n_paths=30000, ranges=ranges)
     print(f"  Completed {len(scenario_df)} scenarios")
 
     print("\n" + "-" * 70)
@@ -300,7 +314,7 @@ def main():
 
     # Base visualizations
     viz = ProductVisualizer(output_dir=output_dir)
-    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=30000)
+    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=30000, ranges=ranges)
     viz.create_all_visualizations(
         pricing_result, sensitivity_df, greeks,
         contract.strike, contract.notional,
@@ -322,7 +336,8 @@ def main():
     generate_enhanced_excel(
         pricing_result, scenario_df, model_results,
         greeks, market, contract,
-        f'{output_dir}/GAAIF_Enhanced_Analysis.xlsx'
+        f'{output_dir}/GAAIF_Enhanced_Analysis.xlsx',
+        provider=provider
     )
 
     print("\n" + "=" * 70)

@@ -253,15 +253,17 @@ def analytical_forward_price(market, contract) -> Dict[str, float]:
     }
 
 
-def run_stress_tests(market, contract, pricer_class, n_paths: int = 30000) -> pd.DataFrame:
+def run_stress_tests(market, contract, pricer_class, n_paths: int = 30000,
+                     ranges=None) -> pd.DataFrame:
     """
     Run stress tests under extreme market scenarios.
 
-    Tests:
-    - Volatility spike (2x normal)
-    - Correlation breakdown
-    - Rate shock scenarios
-    - Spot price moves
+    Args:
+        market: MarketData instance
+        contract: ContractTerms instance
+        pricer_class: StructuredForwardPricer class
+        n_paths: Number of simulation paths
+        ranges: Optional SensitivityRangeGenerator for dynamic scenarios
 
     Returns:
         DataFrame with stress test results
@@ -270,22 +272,32 @@ def run_stress_tests(market, contract, pricer_class, n_paths: int = 30000) -> pd
 
     results = []
 
-    scenarios = [
-        ('Base Case', {}),
-        ('Gold Vol +50%', {'sigma_gold': market.sigma_gold * 1.5}),
-        ('Gold Vol +100%', {'sigma_gold': market.sigma_gold * 2.0}),
-        ('FX Vol +50%', {'sigma_eurusd': market.sigma_eurusd * 1.5}),
-        ('FX Vol +100%', {'sigma_eurusd': market.sigma_eurusd * 2.0}),
-        ('Correlation = 0', {'rho': 0.0}),
-        ('Correlation = -0.5', {'rho': -0.5}),
-        ('Correlation = +0.3', {'rho': 0.3}),
-        ('EUR Rate +100bp', {'r_eur': market.r_eur + 0.01}),
-        ('USD Rate +100bp', {'r_usd': market.r_usd + 0.01}),
-        ('Gold Spot +10%', {'gold_spot': market.gold_spot * 1.1}),
-        ('Gold Spot -10%', {'gold_spot': market.gold_spot * 0.9}),
-        ('EUR/USD at 1.06', {'eurusd_spot': 1.06}),
-        ('EUR/USD at 1.15', {'eurusd_spot': 1.15}),
-    ]
+    # Use dynamic scenarios from ranges if provided, else build relative scenarios
+    if ranges is not None:
+        scenarios = ranges.stress_test_scenarios()
+    else:
+        # Dynamic near-barrier scenarios instead of hardcoded EUR/USD levels
+        near_lower = contract.barrier_lower + 0.02
+        near_upper = contract.barrier_upper - 0.02
+        midpoint = (contract.barrier_lower + contract.barrier_upper) / 2.0
+
+        scenarios = [
+            ('Base Case', {}),
+            ('Gold Vol +50%', {'sigma_gold': market.sigma_gold * 1.5}),
+            ('Gold Vol +100%', {'sigma_gold': market.sigma_gold * 2.0}),
+            ('FX Vol +50%', {'sigma_eurusd': market.sigma_eurusd * 1.5}),
+            ('FX Vol +100%', {'sigma_eurusd': market.sigma_eurusd * 2.0}),
+            ('Correlation = 0', {'rho': 0.0}),
+            ('Correlation = -0.5', {'rho': -0.5}),
+            ('Correlation = +0.3', {'rho': 0.3}),
+            ('EUR Rate +100bp', {'r_eur': market.r_eur + 0.01}),
+            ('USD Rate +100bp', {'r_usd': market.r_usd + 0.01}),
+            ('Gold Spot +10%', {'gold_spot': market.gold_spot * 1.1}),
+            ('Gold Spot -10%', {'gold_spot': market.gold_spot * 0.9}),
+            ('EUR/USD Near Lower', {'eurusd_spot': near_lower}),
+            ('EUR/USD Near Upper', {'eurusd_spot': near_upper}),
+            ('EUR/USD Midpoint', {'eurusd_spot': midpoint}),
+        ]
 
     print("Running stress tests...")
     for name, overrides in scenarios:

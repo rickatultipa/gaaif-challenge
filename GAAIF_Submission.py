@@ -29,16 +29,332 @@ Date: January 2026
 import numpy as np
 import pandas as pd
 from scipy import stats
-from dataclasses import dataclass
-from typing import Tuple, Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Tuple, Optional, Dict, Any, List
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.ticker import FuncFormatter
 import warnings
 import os
+import logging
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
+logger = logging.getLogger(__name__)
+
+# Try to import optional dependencies
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
+
+# =============================================================================
+# VOLATILITY ESTIMATOR (inlined from market_data.py)
+# =============================================================================
+
+class VolatilityEstimator:
+    """Estimates volatilities and correlations from historical data."""
+
+    @staticmethod
+    def calculate_ewma_volatility(prices: pd.Series, lambda_: float = 0.94,
+                                  annualize: bool = True) -> pd.Series:
+        """Calculate EWMA (RiskMetrics-style) volatility."""
+        log_returns = np.log(prices / prices.shift(1))
+        variance = log_returns.ewm(alpha=1-lambda_, adjust=False).var()
+        vol = np.sqrt(variance)
+        if annualize:
+            vol = vol * np.sqrt(252)
+        return vol
+
+    @staticmethod
+    def calculate_correlation(series1: pd.Series, series2: pd.Series,
+                             window: int = 252) -> pd.Series:
+        """Calculate rolling correlation between two return series."""
+        ret1 = np.log(series1 / series1.shift(1))
+        ret2 = np.log(series2 / series2.shift(1))
+        return ret1.rolling(window=window).corr(ret2)
+
+
+# =============================================================================
+# MARKET DATA PROVENANCE
+# =============================================================================
+
+@dataclass
+class MarketDataProvenance:
+    """Tracks the source and freshness of each market data parameter."""
+    source: str
+    timestamp: str
+    ticker: str
+    raw_value: float
+
+
+# =============================================================================
+# MARKET DATA PROVIDER
+# =============================================================================
+
+class MarketDataProvider:
+    """
+    Single source of truth for all market data parameters.
+    Fetches live data via yfinance with graceful fallback.
+    """
+
+    FALLBACK_DEFAULTS = {
+        'gold_spot': 5200.0,
+        'eurusd_spot': 1.18,
+        'r_usd': 0.041,
+        'r_eur': 0.020,
+        'sigma_gold': 0.37,
+        'sigma_eurusd': 0.10,
+        'rho': -0.30,
+        'gold_yield': 0.003,
+    }
+
+    def __init__(self, use_live: bool = True, eur_rate: float = 0.020,
+                 vol_lambda: float = 0.94, corr_window: int = 126):
+        self.use_live = use_live and HAS_YFINANCE
+        self.eur_rate = eur_rate
+        self.vol_lambda = vol_lambda
+        self.corr_window = corr_window
+        self._provenance: Dict[str, MarketDataProvenance] = {}
+
+    def fetch_market_data(self) -> 'MarketData':
+        """Main entry point: returns a MarketData object."""
+        params = dict(self.FALLBACK_DEFAULTS)
+        params['r_eur'] = self.eur_rate
+        now = datetime.now().isoformat(timespec='seconds')
+
+        for key, val in params.items():
+            self._provenance[key] = MarketDataProvenance(
+                source='fallback', timestamp=now, ticker='N/A', raw_value=val
+            )
+
+        if self.use_live:
+            try:
+                self._fetch_spots(params, now)
+                self._estimate_volatilities(params, now)
+                self._estimate_correlation(params, now)
+                self._fetch_interest_rates(params, now)
+                self._estimate_convenience_yield(params, now)
+            except Exception as e:
+                print(f"  [WARN] Live data fetch failed: {e}")
+                print(f"  [INFO] Using fallback defaults (Feb 26, 2026 snapshot)")
+
+        return MarketData(**params)
+
+    def _fetch_spots(self, params: dict, now: str):
+        try:
+            gold = yf.download("GC=F", period="5d", progress=False)
+            if gold is not None and len(gold) > 0:
+                close = gold['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                val = float(close.dropna().iloc[-1])
+                params['gold_spot'] = val
+                self._provenance['gold_spot'] = MarketDataProvenance(
+                    source='live', timestamp=now, ticker='GC=F', raw_value=val)
+        except Exception:
+            pass
+        try:
+            fx = yf.download("EURUSD=X", period="5d", progress=False)
+            if fx is not None and len(fx) > 0:
+                close = fx['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                val = float(close.dropna().iloc[-1])
+                params['eurusd_spot'] = val
+                self._provenance['eurusd_spot'] = MarketDataProvenance(
+                    source='live', timestamp=now, ticker='EURUSD=X', raw_value=val)
+        except Exception:
+            pass
+
+    def _estimate_volatilities(self, params: dict, now: str):
+        estimator = VolatilityEstimator()
+        try:
+            gold_hist = yf.download("GC=F", period="2y", progress=False)
+            if gold_hist is not None and len(gold_hist) > 20:
+                close = gold_hist['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                ewma_vol = estimator.calculate_ewma_volatility(
+                    close.dropna(), lambda_=self.vol_lambda)
+                val = float(ewma_vol.dropna().iloc[-1])
+                if 0.05 < val < 1.5:
+                    params['sigma_gold'] = val
+                    self._provenance['sigma_gold'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='GC=F', raw_value=val)
+        except Exception:
+            pass
+        try:
+            fx_hist = yf.download("EURUSD=X", period="2y", progress=False)
+            if fx_hist is not None and len(fx_hist) > 20:
+                close = fx_hist['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                ewma_vol = estimator.calculate_ewma_volatility(
+                    close.dropna(), lambda_=self.vol_lambda)
+                val = float(ewma_vol.dropna().iloc[-1])
+                if 0.02 < val < 0.5:
+                    params['sigma_eurusd'] = val
+                    self._provenance['sigma_eurusd'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='EURUSD=X', raw_value=val)
+        except Exception:
+            pass
+
+    def _estimate_correlation(self, params: dict, now: str):
+        estimator = VolatilityEstimator()
+        try:
+            gold_hist = yf.download("GC=F", period="2y", progress=False)
+            fx_hist = yf.download("EURUSD=X", period="2y", progress=False)
+            if (gold_hist is not None and fx_hist is not None and
+                    len(gold_hist) > self.corr_window and len(fx_hist) > self.corr_window):
+                gold_close = gold_hist['Close']
+                fx_close = fx_hist['Close']
+                if hasattr(gold_close, 'columns'):
+                    gold_close = gold_close.iloc[:, 0]
+                if hasattr(fx_close, 'columns'):
+                    fx_close = fx_close.iloc[:, 0]
+                corr_series = estimator.calculate_correlation(
+                    gold_close.dropna(), fx_close.dropna(), window=self.corr_window)
+                val = float(corr_series.dropna().iloc[-1])
+                if -1 <= val <= 1:
+                    params['rho'] = val
+                    self._provenance['rho'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='GC=F vs EURUSD=X', raw_value=val)
+        except Exception:
+            pass
+
+    def _fetch_interest_rates(self, params: dict, now: str):
+        try:
+            irx = yf.download("^IRX", period="5d", progress=False)
+            if irx is not None and len(irx) > 0:
+                close = irx['Close']
+                if hasattr(close, 'columns'):
+                    close = close.iloc[:, 0]
+                val = float(close.dropna().iloc[-1]) / 100.0
+                if 0 < val < 0.15:
+                    params['r_usd'] = val
+                    self._provenance['r_usd'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='^IRX', raw_value=val)
+        except Exception:
+            pass
+        params['r_eur'] = self.eur_rate
+        self._provenance['r_eur'] = MarketDataProvenance(
+            source='configured', timestamp=now, ticker='N/A (ECB)', raw_value=self.eur_rate)
+
+    def _estimate_convenience_yield(self, params: dict, now: str):
+        try:
+            spot_data = yf.download("GC=F", period="5d", progress=False)
+            far_data = yf.download("GCJ26.CMX", period="5d", progress=False)
+            if (spot_data is not None and far_data is not None and
+                    len(spot_data) > 0 and len(far_data) > 0):
+                s_close = spot_data['Close']
+                f_close = far_data['Close']
+                if hasattr(s_close, 'columns'):
+                    s_close = s_close.iloc[:, 0]
+                if hasattr(f_close, 'columns'):
+                    f_close = f_close.iloc[:, 0]
+                S = float(s_close.dropna().iloc[-1])
+                F = float(f_close.dropna().iloc[-1])
+                T = 0.25
+                if S > 0 and F > 0:
+                    q = params['r_usd'] - np.log(F / S) / T
+                    q = max(0.0, min(q, 0.05))
+                    params['gold_yield'] = q
+                    self._provenance['gold_yield'] = MarketDataProvenance(
+                        source='live', timestamp=now, ticker='GC=F vs GCJ26.CMX', raw_value=q)
+        except Exception:
+            pass
+
+    def get_provenance_report(self) -> str:
+        lines = ["=" * 70, "DATA PROVENANCE REPORT", "=" * 70]
+        param_labels = {
+            'gold_spot': 'Gold Spot (USD/oz)', 'eurusd_spot': 'EUR/USD Spot',
+            'r_usd': 'USD Risk-Free Rate', 'r_eur': 'EUR Risk-Free Rate',
+            'sigma_gold': 'Gold Volatility (EWMA)', 'sigma_eurusd': 'EUR/USD Volatility (EWMA)',
+            'rho': 'Gold-EURUSD Correlation', 'gold_yield': 'Gold Convenience Yield',
+        }
+        for key, label in param_labels.items():
+            prov = self._provenance.get(key)
+            if prov:
+                if key in ('r_usd', 'r_eur', 'sigma_gold', 'sigma_eurusd', 'gold_yield'):
+                    val_str = f"{prov.raw_value*100:.2f}%"
+                elif key == 'rho':
+                    val_str = f"{prov.raw_value:.3f}"
+                elif key == 'gold_spot':
+                    val_str = f"${prov.raw_value:,.2f}"
+                else:
+                    val_str = f"{prov.raw_value:.4f}"
+                source_tag = f"[{prov.source.upper()}]"
+                ticker_str = f"({prov.ticker})" if prov.ticker != 'N/A' else ""
+                lines.append(f"  {label:<30s} {val_str:>12s}  {source_tag:<12s} {ticker_str}")
+        lines.append(f"\n  Timestamp: {self._provenance.get('gold_spot', MarketDataProvenance('','','',0)).timestamp}")
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+    def get_provenance_dataframe(self) -> pd.DataFrame:
+        rows = []
+        param_labels = {
+            'gold_spot': 'Gold Spot (USD/oz)', 'eurusd_spot': 'EUR/USD Spot',
+            'r_usd': 'USD Risk-Free Rate', 'r_eur': 'EUR Risk-Free Rate',
+            'sigma_gold': 'Gold Volatility (EWMA)', 'sigma_eurusd': 'EUR/USD Volatility (EWMA)',
+            'rho': 'Gold-EURUSD Correlation', 'gold_yield': 'Gold Convenience Yield',
+        }
+        for key, label in param_labels.items():
+            prov = self._provenance.get(key)
+            if prov:
+                rows.append({'Parameter': label, 'Value': prov.raw_value,
+                             'Source': prov.source, 'Ticker': prov.ticker,
+                             'Timestamp': prov.timestamp})
+        return pd.DataFrame(rows)
+
+
+# =============================================================================
+# SENSITIVITY RANGE GENERATOR
+# =============================================================================
+
+class SensitivityRangeGenerator:
+    """Generates dynamic sensitivity ranges based on current market conditions."""
+
+    def __init__(self, market: 'MarketData', contract: 'ContractTerms'):
+        self.market = market
+        self.contract = contract
+
+    def gold_spot_range(self, n: int = 9) -> np.ndarray:
+        S = self.market.gold_spot
+        sigma = self.market.sigma_gold
+        T = self.contract.tenor
+        spread = 2.0 * sigma * S * np.sqrt(T)
+        lo = max(S - spread, S * 0.3)
+        return np.linspace(lo, S + spread, n)
+
+    def eurusd_spot_range(self, n: int = 10) -> np.ndarray:
+        lo = self.contract.barrier_lower + 0.01
+        hi = self.contract.barrier_upper - 0.01
+        return np.linspace(lo, hi, n)
+
+    def gold_vol_range(self, n: int = 11) -> np.ndarray:
+        center = self.market.sigma_gold
+        return np.linspace(max(center * 0.4, 0.05), center * 2.0, n)
+
+    def eurusd_vol_range(self, n: int = 11) -> np.ndarray:
+        center = self.market.sigma_eurusd
+        return np.linspace(max(center * 0.4, 0.02), center * 2.0, n)
+
+    def correlation_range(self, n: int = 11) -> np.ndarray:
+        center = self.market.rho
+        return np.linspace(max(center - 0.4, -0.9), min(center + 0.4, 0.9), n)
+
+    def payoff_diagram_range(self) -> Tuple[float, float]:
+        K = self.contract.strike
+        S = self.market.gold_spot
+        sigma = self.market.sigma_gold
+        T = self.contract.tenor
+        spread = 2.0 * sigma * S * np.sqrt(T)
+        lo = max(min(K, S) - spread * 0.5, K * 0.5)
+        hi = max(K, S) + spread * 0.5
+        return (lo, hi)
+
 
 # =============================================================================
 # DATA CLASSES
@@ -51,24 +367,27 @@ class MarketData:
 
     All rates are annualized and continuously compounded.
     Volatilities are annualized (sqrt(252) scaling for daily).
+
+    Default values are fallback references (Feb 26, 2026 snapshot).
+    In production, use MarketDataProvider to populate with live data.
     """
-    # Spot prices
-    gold_spot: float = 2750.0       # Current LBMA gold price (USD/oz)
-    eurusd_spot: float = 1.08       # Current EUR/USD exchange rate
+    # Spot prices - Feb 26, 2026 fallback reference
+    gold_spot: float = 5200.0       # Gold near ~$5,200/oz
+    eurusd_spot: float = 1.18       # EUR/USD ~1.18
 
     # Risk-free interest rates (continuous compounding)
-    r_eur: float = 0.025            # EUR risk-free rate (~2.5% ECB)
-    r_usd: float = 0.045            # USD risk-free rate (~4.5% Fed)
+    r_eur: float = 0.020            # EUR risk-free rate (~2.0% ECB)
+    r_usd: float = 0.041            # USD risk-free rate (~4.1% T-bill proxy)
 
-    # Implied volatilities (annualized)
-    sigma_gold: float = 0.18        # Gold volatility (~18%)
-    sigma_eurusd: float = 0.08      # EUR/USD volatility (~8%)
+    # Implied volatilities (annualized) - elevated regime
+    sigma_gold: float = 0.37        # Gold EWMA vol (GVZ ~37%)
+    sigma_eurusd: float = 0.10      # EUR/USD EWMA vol ~10%
 
     # Asset correlation
-    rho: float = -0.25              # Gold-EURUSD correlation (typically negative)
+    rho: float = -0.30              # Gold-EURUSD correlation
 
     # Gold convenience yield / lease rate
-    gold_yield: float = 0.005       # ~0.5% convenience yield
+    gold_yield: float = 0.003       # Convenience yield from futures term structure
 
 
 @dataclass
@@ -601,30 +920,27 @@ class StructuredForwardPricer:
 # =============================================================================
 
 def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
-                             n_paths: int = 50000) -> pd.DataFrame:
+                             n_paths: int = 50000, ranges=None) -> pd.DataFrame:
     """
     Run comprehensive sensitivity analysis on key model parameters.
-
-    Analyzes sensitivity to:
-    - Gold spot price
-    - EUR/USD spot rate
-    - Gold volatility
-    - EUR/USD volatility
-    - Asset correlation
 
     Args:
         market: Base market data
         contract: Contract terms
         n_paths: Number of simulation paths
+        ranges: Optional SensitivityRangeGenerator for dynamic ranges
 
     Returns:
         DataFrame with sensitivity results
     """
+    if ranges is None:
+        ranges = SensitivityRangeGenerator(market, contract)
+
     results = []
 
-    # Gold spot sensitivity
+    # Gold spot sensitivity (dynamic range)
     print("  Analyzing gold spot sensitivity...")
-    gold_spots = np.linspace(2400, 3200, 9)
+    gold_spots = ranges.gold_spot_range(9)
     for gs in gold_spots:
         m = MarketData(gold_spot=gs, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -638,9 +954,9 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
             'knockout_rate': res['knockout_rate']
         })
 
-    # EUR/USD spot sensitivity
+    # EUR/USD spot sensitivity (barrier-bounded)
     print("  Analyzing EUR/USD spot sensitivity...")
-    eurusd_spots = np.linspace(1.06, 1.24, 10)
+    eurusd_spots = ranges.eurusd_spot_range(10)
     for fx in eurusd_spots:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=fx,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -654,9 +970,9 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
             'knockout_rate': res['knockout_rate']
         })
 
-    # Gold volatility sensitivity
+    # Gold volatility sensitivity (dynamic range)
     print("  Analyzing gold volatility sensitivity...")
-    gold_vols = np.linspace(0.10, 0.30, 11)
+    gold_vols = ranges.gold_vol_range(11)
     for vol in gold_vols:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -670,9 +986,9 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
             'knockout_rate': res['knockout_rate']
         })
 
-    # EUR/USD volatility sensitivity
+    # EUR/USD volatility sensitivity (dynamic range)
     print("  Analyzing EUR/USD volatility sensitivity...")
-    eurusd_vols = np.linspace(0.04, 0.14, 11)
+    eurusd_vols = ranges.eurusd_vol_range(11)
     for vol in eurusd_vols:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -686,9 +1002,9 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
             'knockout_rate': res['knockout_rate']
         })
 
-    # Correlation sensitivity
+    # Correlation sensitivity (dynamic range)
     print("  Analyzing correlation sensitivity...")
-    correlations = np.linspace(-0.6, 0.4, 11)
+    correlations = ranges.correlation_range(11)
     for rho in correlations:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -711,7 +1027,7 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
 
 def create_visualizations(pricing_result: Dict, sensitivity_df: pd.DataFrame,
                           greeks: Dict, contract: ContractTerms,
-                          output_dir: str = 'output'):
+                          output_dir: str = 'output', market: MarketData = None):
     """
     Generate all visualizations for the product proposal.
 
@@ -810,11 +1126,17 @@ def create_visualizations(pricing_result: Dict, sensitivity_df: pd.DataFrame,
     plt.savefig(f'{output_dir}/payoff_distribution.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 3. Payoff Diagram
+    # 3. Payoff Diagram (dynamic range)
     print("  Generating payoff diagram...")
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    gold_prices = np.linspace(3500, 6000, 200)
+    if market is not None:
+        rgen = SensitivityRangeGenerator(market, contract)
+        payoff_lo, payoff_hi = rgen.payoff_diagram_range()
+    else:
+        spread = contract.strike * 0.3
+        payoff_lo, payoff_hi = contract.strike - spread, contract.strike + spread
+    gold_prices = np.linspace(payoff_lo, payoff_hi, 200)
     zgroup_payoff = contract.notional * (gold_prices - contract.strike) / contract.strike
     abank_payoff = -zgroup_payoff
 
@@ -922,7 +1244,7 @@ def create_visualizations(pricing_result: Dict, sensitivity_df: pd.DataFrame,
 
 def generate_excel_output(pricing_result: Dict, sensitivity_df: pd.DataFrame,
                           greeks: Dict, market: MarketData, contract: ContractTerms,
-                          output_path: str):
+                          output_path: str, provider=None):
     """
     Generate comprehensive Excel file with all analysis data.
 
@@ -1100,6 +1422,11 @@ def generate_excel_output(pricing_result: Dict, sensitivity_df: pd.DataFrame,
         })
         sample_data.to_excel(writer, sheet_name='Sample Paths', index=False)
 
+        # Sheet 8: Data Provenance
+        if provider is not None:
+            prov_df = provider.get_provenance_dataframe()
+            prov_df.to_excel(writer, sheet_name='Data Provenance', index=False)
+
     print(f"Excel file saved to: {output_path}")
 
 
@@ -1272,21 +1599,13 @@ def main():
     output_dir = 'output'
     os.makedirs(output_dir, exist_ok=True)
 
-    # Initialize market data
+    # Initialize market data via provider (live fetch with fallback)
     print("\n" + "-" * 70)
     print("INITIALIZING MARKET DATA")
     print("-" * 70)
 
-    market = MarketData(
-        gold_spot=2750.0,        # Current gold price
-        eurusd_spot=1.08,        # Current EUR/USD
-        r_eur=0.025,             # ECB rate
-        r_usd=0.045,             # Fed rate
-        sigma_gold=0.18,         # Gold volatility
-        sigma_eurusd=0.08,       # EUR/USD volatility
-        rho=-0.25,               # Negative correlation
-        gold_yield=0.005         # Convenience yield
-    )
+    provider = MarketDataProvider(use_live=True)
+    market = provider.fetch_market_data()
 
     contract = ContractTerms(
         notional=500_000_000,
@@ -1295,6 +1614,12 @@ def main():
         barrier_lower=1.05,
         barrier_upper=1.25
     )
+
+    # Print provenance report
+    print(provider.get_provenance_report())
+
+    # Create dynamic sensitivity ranges
+    ranges = SensitivityRangeGenerator(market, contract)
 
     print(f"\nMarket Parameters:")
     print(f"  Gold Spot:        ${market.gold_spot:,.2f}/oz")
@@ -1403,14 +1728,14 @@ def main():
     print("SENSITIVITY ANALYSIS")
     print("-" * 70)
 
-    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=50000)
+    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=50000, ranges=ranges)
 
     # Visualizations
     print("\n" + "-" * 70)
     print("GENERATING VISUALIZATIONS")
     print("-" * 70)
 
-    create_visualizations(pricing_result, sensitivity_df, greeks, contract, output_dir)
+    create_visualizations(pricing_result, sensitivity_df, greeks, contract, output_dir, market=market)
 
     # Excel Output
     print("\n" + "-" * 70)
@@ -1420,7 +1745,8 @@ def main():
     generate_excel_output(
         pricing_result, sensitivity_df, greeks,
         market, contract,
-        f'{output_dir}/GAAIF_Analysis_Data.xlsx'
+        f'{output_dir}/GAAIF_Analysis_Data.xlsx',
+        provider=provider
     )
 
     # Quanto Impact Analysis

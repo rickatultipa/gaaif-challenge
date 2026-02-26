@@ -14,14 +14,19 @@ import os
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from pricing_model import MarketData, ContractTerms, StructuredForwardPricer, CorrelatedGBMSimulator
+from market_data import MarketDataProvider, SensitivityRangeGenerator
 
 # Create output directory
 os.makedirs('output/pdf_charts', exist_ok=True)
 
-# Initialize market data and contract
-market = MarketData()
+# Initialize market data via provider (live fetch with fallback)
+provider = MarketDataProvider(use_live=True)
+market = provider.fetch_market_data()
 contract = ContractTerms()
 pricer = StructuredForwardPricer(market, contract)
+
+# Create dynamic sensitivity ranges
+ranges = SensitivityRangeGenerator(market, contract)
 
 print("=" * 60)
 print("UPDATING CHARTS WITH ENRICHED DATA")
@@ -47,7 +52,7 @@ colors = {
 # 1. GOLD SENSITIVITY - 20 data points (matching Excel)
 # =============================================================================
 print("\n1. Generating Gold Sensitivity Chart (20 points)...")
-gold_spots = np.linspace(4000, 5800, 20)
+gold_spots = ranges.gold_spot_range(20)
 gold_pvs = []
 gold_ko_rates = []
 
@@ -89,7 +94,7 @@ plt.close()
 # 2. EUR/USD SENSITIVITY - 20 data points (matching Excel)
 # =============================================================================
 print("\n2. Generating EUR/USD Sensitivity Chart (20 points)...")
-fx_spots = np.linspace(1.06, 1.24, 20)
+fx_spots = ranges.eurusd_spot_range(20)
 fx_pvs = []
 fx_ko_rates = []
 fx_upper_rates = []
@@ -138,8 +143,8 @@ plt.close()
 # 3. VOLATILITY SURFACE (2D Grid) - matching Excel
 # =============================================================================
 print("\n3. Generating Volatility Surface (2D Grid)...")
-gold_vols = np.linspace(0.15, 0.40, 6)
-fx_vols = np.linspace(0.06, 0.14, 5)
+gold_vols = ranges.gold_vol_range(6)
+fx_vols = ranges.eurusd_vol_range(5)
 
 vol_grid = np.zeros((len(fx_vols), len(gold_vols)))
 
@@ -176,7 +181,7 @@ plt.close()
 # 4. CORRELATION SENSITIVITY - 15 points (matching Excel)
 # =============================================================================
 print("\n4. Generating Correlation Sensitivity Chart (15 points)...")
-correlations = np.linspace(-0.6, 0.4, 15)
+correlations = ranges.correlation_range(15)
 corr_pvs = []
 corr_ko_rates = []
 
@@ -355,36 +360,40 @@ plt.close()
 # 8. UPDATED VALUATION COMPARISON (with enriched data context)
 # =============================================================================
 print("\n8. Generating Valuation Comparison Chart...")
-comparison_data = {
-    'Metric': ['Gold Spot', 'EUR/USD', 'Volatility', 'Z Group PV', 'Knockout Rate'],
-    'January 2026': ['$2,750', '1.08', '18%', 'EUR -192M', '92.6%'],
-    'February 2026': ['$4,900', '1.19', '28%', 'EUR +46M', '94.8%'],
-    'Change': ['+78%', '+10%', '+56%', '+EUR 238M', '+2.2pp']
-}
 
 fig, ax = plt.subplots(figsize=(10, 6))
 
-categories = ['Gold Price\n($/oz)', 'EUR/USD\nSpot', 'Z Group PV\n(EUR M)', 'Knockout\nRate (%)']
-old_values = [2750/4900*100, 1.08/1.19*100, -192/46*-1, 92.6]  # Normalized
-new_values = [100, 100, 100, 94.8/92.6*100]
+categories = ['Gold Price\n($/oz)', 'EUR/USD\nSpot', 'Gold Vol\n(%)', 'Z Group PV\n(EUR M)']
+
+# Jan 2026 values → Feb 26, 2026 values (normalized to Feb = 100)
+jan_gold, feb_gold = 4900, market.gold_spot
+jan_fx, feb_fx = 1.08, market.eurusd_spot
+jan_vol, feb_vol = 0.28, market.sigma_gold
+jan_pv, feb_pv = 46, 64  # EUR millions
+
+jan_normalized = [jan_gold/feb_gold*100, jan_fx/feb_fx*100, jan_vol/feb_vol*100, jan_pv/feb_pv*100]
+feb_normalized = [100, 100, 100, 100]
 
 x = np.arange(len(categories))
 width = 0.35
 
-bars1 = ax.bar(x - width/2, [56, 91, 0, 98], width, label='January 2026', color=colors['neutral'], alpha=0.7)
-bars2 = ax.bar(x + width/2, [100, 100, 100, 100], width, label='February 2026', color=colors['positive'], alpha=0.8)
+bars1 = ax.bar(x - width/2, jan_normalized, width, label='Jan 2026', color=colors['neutral'], alpha=0.7)
+bars2 = ax.bar(x + width/2, feb_normalized, width, label='Feb 26, 2026', color=colors['positive'], alpha=0.8)
 
 ax.set_ylabel('Normalized Value (Current = 100)', fontsize=12)
-ax.set_title('Market Conditions & Valuation Change (Jan vs Feb 2026)', fontsize=14, fontweight='bold')
+ax.set_title('Market Conditions & Valuation Change (Jan → Feb 26, 2026)', fontsize=14, fontweight='bold')
 ax.set_xticks(x)
 ax.set_xticklabels(categories)
 ax.legend()
 
 # Add annotations
-ax.annotate('$2,750 → $4,900\n(+78%)', xy=(0, 110), ha='center', fontsize=9, color=colors['positive'], fontweight='bold')
-ax.annotate('1.08 → 1.19\n(+10%)', xy=(1, 110), ha='center', fontsize=9, color=colors['positive'], fontweight='bold')
-ax.annotate('-EUR 192M → +EUR 46M\n(+EUR 238M swing!)', xy=(2, 110), ha='center', fontsize=9, color=colors['positive'], fontweight='bold')
-ax.annotate('92.6% → 94.8%', xy=(3, 110), ha='center', fontsize=9)
+gold_chg = (feb_gold - jan_gold) / jan_gold * 100
+fx_chg = (feb_fx - jan_fx) / jan_fx * 100
+vol_chg = (feb_vol - jan_vol) / jan_vol * 100
+ax.annotate(f'${jan_gold:,.0f} → ${feb_gold:,.0f}\n(+{gold_chg:.0f}%)', xy=(0, 110), ha='center', fontsize=9, color=colors['positive'], fontweight='bold')
+ax.annotate(f'{jan_fx:.2f} → {feb_fx:.3f}\n(+{fx_chg:.0f}%)', xy=(1, 110), ha='center', fontsize=9, color=colors['positive'], fontweight='bold')
+ax.annotate(f'{jan_vol*100:.0f}% → {feb_vol*100:.0f}%\n(+{vol_chg:.0f}%)', xy=(2, 110), ha='center', fontsize=9, color=colors['positive'], fontweight='bold')
+ax.annotate(f'+EUR {jan_pv}M → +EUR {feb_pv}M\n(+EUR {feb_pv-jan_pv}M)', xy=(3, 110), ha='center', fontsize=9, color=colors['positive'], fontweight='bold')
 
 ax.set_ylim(0, 130)
 plt.tight_layout()
@@ -508,7 +517,7 @@ plt.close()
 print("\n12. Generating Gold History Chart...")
 # Create stylized historical chart
 months = ['Jan 25', 'Apr 25', 'Jul 25', 'Oct 25', 'Jan 26', 'Feb 26']
-gold_history = [2750, 3100, 3800, 4200, 5608, 4900]
+gold_history = [2750, 3100, 3800, 4200, 5608, market.gold_spot]
 
 fig, ax = plt.subplots(figsize=(10, 5))
 ax.plot(months, gold_history, color=colors['gold'], linewidth=3, marker='o', markersize=8)
@@ -516,8 +525,8 @@ ax.fill_between(months, gold_history, alpha=0.2, color=colors['gold'])
 ax.axhline(y=contract.strike, color=colors['negative'], linestyle='--', linewidth=2, label=f'Strike ${contract.strike:,.0f}')
 ax.annotate('Record High\n$5,608', xy=(4, 5608), xytext=(3.5, 5700), fontsize=10, fontweight='bold',
             arrowprops=dict(arrowstyle='->', color=colors['positive']))
-ax.annotate('7%+ Crash', xy=(4.5, 5250), xytext=(4.2, 5400), fontsize=9, color=colors['negative'],
-            arrowprops=dict(arrowstyle='->', color=colors['negative']))
+ax.annotate(f'Current\n${market.gold_spot:,.0f}', xy=(5, market.gold_spot), xytext=(4.5, market.gold_spot + 300), fontsize=9, color=colors['secondary'],
+            arrowprops=dict(arrowstyle='->', color=colors['secondary']))
 
 ax.set_xlabel('Date', fontsize=12, fontweight='bold')
 ax.set_ylabel('Gold Price ($/oz)', fontsize=12)

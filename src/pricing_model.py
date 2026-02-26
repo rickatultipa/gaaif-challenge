@@ -30,26 +30,28 @@ warnings.filterwarnings('ignore')
 
 @dataclass
 class MarketData:
-    """Container for market data parameters."""
-    # Spot prices - UPDATED Feb 1, 2026
-    # Gold crashed from $5,608 high on Jan 28 to ~$4,900, still well above strike
-    gold_spot: float = 4900.0  # Current gold price (USD/oz) - Feb 2026
-    eurusd_spot: float = 1.19  # Current EUR/USD rate - near 4-year high
+    """Container for market data parameters.
+
+    Default values are fallback references (Feb 26, 2026 snapshot).
+    In production, use MarketDataProvider to populate with live data.
+    """
+    # Spot prices - Feb 26, 2026 fallback reference
+    gold_spot: float = 5200.0   # Gold near ~$5,200/oz
+    eurusd_spot: float = 1.18   # EUR/USD ~1.18
 
     # Interest rates (annualized, continuous compounding)
-    r_eur: float = 0.025  # EUR risk-free rate (ECB)
-    r_usd: float = 0.0425  # USD risk-free rate (Fed has been cutting)
+    r_eur: float = 0.020        # ECB deposit rate ~2.0%
+    r_usd: float = 0.041        # 13-week T-bill proxy ~4.1%
 
-    # Volatilities (annualized) - INCREASED due to recent extreme moves
-    # Gold dropped 7%+ in one week - realized vol is spiking
-    sigma_gold: float = 0.28  # Gold volatility - elevated (~28% given recent crash)
-    sigma_eurusd: float = 0.10  # EUR/USD volatility (~10% - also elevated)
+    # Volatilities (annualized) - elevated regime
+    sigma_gold: float = 0.37    # Gold EWMA vol (GVZ ~37%)
+    sigma_eurusd: float = 0.10  # EUR/USD EWMA vol ~10%
 
-    # Correlation - may have shifted during crisis
-    rho: float = -0.30  # Gold-EURUSD correlation (stronger negative in crisis)
+    # Correlation
+    rho: float = -0.30          # Gold-EURUSD correlation
 
     # Gold convenience yield
-    gold_yield: float = 0.003  # Reduced lease rate in high-price environment
+    gold_yield: float = 0.003   # Convenience yield from futures term structure
 
 
 @dataclass
@@ -440,17 +442,29 @@ class StructuredForwardPricer:
 
 
 def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
-                            n_paths: int = 50000) -> pd.DataFrame:
+                            n_paths: int = 50000, ranges=None) -> pd.DataFrame:
     """
     Run sensitivity analysis on key parameters.
+
+    Args:
+        market: Base market data
+        contract: Contract terms
+        n_paths: Number of simulation paths
+        ranges: Optional SensitivityRangeGenerator for dynamic ranges.
+                If None, one is created from market/contract (backward compat).
 
     Returns:
         DataFrame with sensitivity results
     """
+    # Create default ranges if not provided
+    if ranges is None:
+        from market_data import SensitivityRangeGenerator
+        ranges = SensitivityRangeGenerator(market, contract)
+
     results = []
 
     # Gold spot sensitivity
-    gold_spots = np.linspace(2400, 3200, 9)
+    gold_spots = ranges.gold_spot_range(9)
     for gs in gold_spots:
         m = MarketData(gold_spot=gs, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -465,7 +479,7 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
         })
 
     # EUR/USD spot sensitivity
-    eurusd_spots = np.linspace(1.06, 1.24, 10)
+    eurusd_spots = ranges.eurusd_spot_range(10)
     for fx in eurusd_spots:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=fx,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -480,7 +494,7 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
         })
 
     # Gold volatility sensitivity
-    gold_vols = np.linspace(0.10, 0.30, 11)
+    gold_vols = ranges.gold_vol_range(11)
     for vol in gold_vols:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -495,7 +509,7 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
         })
 
     # EUR/USD volatility sensitivity
-    eurusd_vols = np.linspace(0.04, 0.14, 11)
+    eurusd_vols = ranges.eurusd_vol_range(11)
     for vol in eurusd_vols:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,
@@ -510,7 +524,7 @@ def run_sensitivity_analysis(market: MarketData, contract: ContractTerms,
         })
 
     # Correlation sensitivity
-    correlations = np.linspace(-0.6, 0.4, 11)
+    correlations = ranges.correlation_range(11)
     for rho in correlations:
         m = MarketData(gold_spot=market.gold_spot, eurusd_spot=market.eurusd_spot,
                       r_eur=market.r_eur, r_usd=market.r_usd,

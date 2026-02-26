@@ -20,11 +20,15 @@ warnings.filterwarnings('ignore')
 
 @dataclass
 class HestonParams:
-    """Parameters for Heston stochastic volatility model."""
-    # Initial variance
-    v0: float = 0.0324           # Initial variance (18%^2)
-    # Long-term variance
-    theta: float = 0.04          # Long-term variance (20%^2)
+    """Parameters for Heston stochastic volatility model.
+
+    Default v0 and theta derive from current market vol (37%^2 for Feb 2026).
+    Override with market-derived values when available.
+    """
+    # Initial variance (derived from market vol)
+    v0: float = 0.1369           # Initial variance (37%^2)
+    # Long-term variance (slightly above current)
+    theta: float = 0.1506        # Long-term variance (37%^2 × 1.1)
     # Mean reversion speed
     kappa: float = 2.0           # Mean reversion rate
     # Volatility of volatility
@@ -190,26 +194,32 @@ class MertonJumpSimulator:
         return S
 
 
-def run_scenario_analysis(base_market, base_contract, n_paths: int = 50000) -> pd.DataFrame:
+def run_scenario_analysis(base_market, base_contract, n_paths: int = 50000,
+                          ranges=None) -> pd.DataFrame:
     """
     Run comprehensive scenario analysis across different parameter combinations.
 
-    Tests:
-    - Different strike prices
-    - Different barrier levels
-    - Different volatility assumptions
-    - Different correlation assumptions
+    Args:
+        base_market: MarketData instance
+        base_contract: ContractTerms instance
+        n_paths: Number of simulation paths
+        ranges: Optional SensitivityRangeGenerator for dynamic ranges
 
     Returns:
         DataFrame with scenario results
     """
     from pricing_model import MarketData, ContractTerms, StructuredForwardPricer
 
+    # Create default ranges if not provided
+    if ranges is None:
+        from market_data import SensitivityRangeGenerator
+        ranges = SensitivityRangeGenerator(base_market, base_contract)
+
     results = []
 
-    # Scenario 1: Different Strike Prices
+    # Scenario 1: Different Strike Prices (dynamic)
     print("  Running strike scenarios...")
-    strikes = [3000, 3500, 4000, 4600, 5000, 5500]
+    strikes = ranges.scenario_strikes()
     for K in strikes:
         contract = ContractTerms(
             notional=base_contract.notional,
@@ -259,15 +269,9 @@ def run_scenario_analysis(base_market, base_contract, n_paths: int = 50000) -> p
             'avg_ko_time': res['avg_knockout_time']
         })
 
-    # Scenario 3: Different Volatility Regimes
+    # Scenario 3: Different Volatility Regimes (dynamic)
     print("  Running volatility scenarios...")
-    vol_scenarios = [
-        (0.12, 0.06, 'Low Vol'),
-        (0.15, 0.07, 'Moderate Vol'),
-        (0.18, 0.08, 'Base Vol'),
-        (0.22, 0.10, 'High Vol'),
-        (0.28, 0.12, 'Crisis Vol'),
-    ]
+    vol_scenarios = ranges.scenario_vol_regimes()
     for gold_vol, fx_vol, name in vol_scenarios:
         market = MarketData(
             gold_spot=base_market.gold_spot,
@@ -291,9 +295,9 @@ def run_scenario_analysis(base_market, base_contract, n_paths: int = 50000) -> p
             'avg_ko_time': res['avg_knockout_time']
         })
 
-    # Scenario 4: Different EUR/USD Starting Points
+    # Scenario 4: Different EUR/USD Starting Points (dynamic)
     print("  Running EUR/USD spot scenarios...")
-    fx_spots = [1.06, 1.08, 1.10, 1.12, 1.15, 1.18, 1.20]
+    fx_spots = ranges.eurusd_spot_range(7)
     for fx in fx_spots:
         market = MarketData(
             gold_spot=base_market.gold_spot,
@@ -346,11 +350,11 @@ def run_model_comparison(market, contract, n_paths: int = 50000) -> Dict:
         'std_error': base_result['std_error']
     }
 
-    # 2. Heston Model for Gold
+    # 2. Heston Model for Gold (derive from current market vol)
     print("  Running Heston stochastic volatility model...")
     heston_params = HestonParams(
         v0=market.sigma_gold**2,
-        theta=market.sigma_gold**2 * 1.1,  # Slightly higher long-term vol
+        theta=market.sigma_gold**2 * 1.1,
         kappa=2.0,
         xi=0.3,
         rho_sv=-0.7
@@ -433,17 +437,17 @@ if __name__ == "__main__":
     market = MarketData()
     contract = ContractTerms()
 
-    # Test Heston
+    # Test Heston (using market defaults)
     print("\nTesting Heston Model...")
     heston = HestonSimulator(HestonParams(), seed=42)
-    S, V = heston.simulate(2750, 0.04, 2.0, 1000, 252)
+    S, V = heston.simulate(market.gold_spot, market.r_usd - market.gold_yield, 2.0, 1000, 252)
     print(f"  Final price range: [{S[:, -1].min():.0f}, {S[:, -1].max():.0f}]")
     print(f"  Final vol range: [{np.sqrt(V[:, -1]).min()*100:.1f}%, {np.sqrt(V[:, -1]).max()*100:.1f}%]")
 
     # Test Merton
     print("\nTesting Merton Model...")
     merton = MertonJumpSimulator(JumpParams(), seed=42)
-    S_jump = merton.simulate(2750, 0.04, 0.18, 2.0, 1000, 252)
+    S_jump = merton.simulate(market.gold_spot, market.r_usd - market.gold_yield, market.sigma_gold, 2.0, 1000, 252)
     print(f"  Final price range: [{S_jump[:, -1].min():.0f}, {S_jump[:, -1].max():.0f}]")
 
     print("\nAdvanced model tests complete!")

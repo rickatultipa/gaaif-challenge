@@ -27,7 +27,8 @@ from pricing_model import (
     run_sensitivity_analysis
 )
 from market_data import (
-    MarketDataFetcher, VolatilityEstimator, create_sample_market_data
+    MarketDataFetcher, VolatilityEstimator, create_sample_market_data,
+    MarketDataProvider, SensitivityRangeGenerator
 )
 from visualization import ProductVisualizer
 
@@ -249,21 +250,13 @@ def main():
     # Create output directories
     create_output_directories()
 
-    # Initialize market data with realistic parameters
+    # Initialize market data via provider (live fetch with fallback)
     print("\n" + "-" * 70)
     print("INITIALIZING MARKET DATA")
     print("-" * 70)
 
-    market = MarketData(
-        gold_spot=2750.0,        # Current gold price
-        eurusd_spot=1.08,        # Current EUR/USD
-        r_eur=0.025,             # ECB rate ~2.5%
-        r_usd=0.045,             # Fed rate ~4.5%
-        sigma_gold=0.18,         # Gold volatility ~18%
-        sigma_eurusd=0.08,       # EUR/USD volatility ~8%
-        rho=-0.25,               # Typical negative correlation
-        gold_yield=0.005         # Gold convenience yield
-    )
+    provider = MarketDataProvider(use_live=True)
+    market = provider.fetch_market_data()
 
     contract = ContractTerms(
         notional=500_000_000,    # EUR 500M
@@ -272,6 +265,12 @@ def main():
         barrier_lower=1.05,      # Lower barrier
         barrier_upper=1.25       # Upper barrier
     )
+
+    # Print provenance report
+    print(provider.get_provenance_report())
+
+    # Create dynamic sensitivity ranges
+    ranges = SensitivityRangeGenerator(market, contract)
 
     print(f"\nMarket Parameters:")
     print(f"  Gold Spot:        ${market.gold_spot:,.2f}/oz")
@@ -336,7 +335,7 @@ def main():
     print("SENSITIVITY ANALYSIS")
     print("-" * 70)
 
-    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=50000)
+    sensitivity_df = run_sensitivity_analysis(market, contract, n_paths=50000, ranges=ranges)
 
     # Convergence Analysis
     convergence_df = run_convergence_analysis(market, contract)

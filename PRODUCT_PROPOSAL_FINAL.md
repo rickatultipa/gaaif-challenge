@@ -2,7 +2,7 @@
 title: "Structured Gold Forward with Knock-Out Barriers"
 subtitle: "Product Development Memorandum"
 author: "Derivatives Structuring Desk"
-date: "January 2026"
+date: "February 2026"
 subject: "Pricing and Risk Analysis — Zeus Gold Group Hedging Facility"
 ---
 
@@ -14,7 +14,7 @@ subject: "Pricing and Risk Analysis — Zeus Gold Group Hedging Facility"
 
 **FROM:** Derivatives Structuring Desk
 
-**DATE:** January 2026
+**DATE:** February 2026
 
 **RE:** Pricing and Risk Analysis — Zeus Gold Group AG Hedging Facility
 
@@ -40,12 +40,12 @@ We have developed a comprehensive pricing framework validated through multiple m
 
 | Metric | Result |
 |--------|--------|
-| Z Group Present Value | EUR −192 million |
-| Alphabank Present Value | EUR +192 million |
-| Knock-Out Probability | 93% |
-| Expected Contract Duration | 5 months |
+| Z Group Present Value | EUR +64 million |
+| Alphabank Present Value | EUR −64 million |
+| Knock-Out Probability | 64% |
+| Expected Contract Duration | 12 months |
 
-The negative present value for Z Group reflects the strike price being set 54% above the two-year gold forward. The high knock-out probability stems from the lower barrier's proximity to current spot (2.8% distance) combined with negative EUR/USD drift from interest rate differentials.
+The positive present value for Z Group reflects gold's surge above the strike price, placing the forward at 113% moneyness. The 64% knock-out probability is driven primarily by the upper barrier's proximity to current EUR/USD spot (5.8% distance), representing a fundamental reversal from earlier market conditions where the lower barrier dominated.
 
 \newpage
 
@@ -105,14 +105,14 @@ $$\mathbb{E}[dW_t^{(1)} \cdot dW_t^{(2)}] = \rho\,dt$$
 
 | Parameter | Symbol | Value | Source |
 |-----------|--------|-------|--------|
-| Gold spot | $S_0$ | USD 2,750/oz | LBMA Jan 2026 |
-| EUR/USD spot | $X_0$ | 1.08 | ECB reference |
-| USD risk-free rate | $r_{USD}$ | 4.5% | OIS curve |
-| EUR risk-free rate | $r_{EUR}$ | 2.5% | OIS curve |
-| Gold volatility | $\sigma_S$ | 18% | 1Y ATM implied |
-| EUR/USD volatility | $\sigma_X$ | 8% | 1Y ATM implied |
-| Correlation | $\rho$ | −0.25 | 1Y historical |
-| Gold convenience yield | $q$ | 0.5% | GOFO proxy |
+| Gold spot | $S_0$ | USD 5,203/oz | yfinance live (GC=F, Feb 2026) |
+| EUR/USD spot | $X_0$ | 1.181 | yfinance live (EURUSD=X, Feb 2026) |
+| USD risk-free rate | $r_{USD}$ | 3.6% | 13-week T-bill (^IRX) |
+| EUR risk-free rate | $r_{EUR}$ | 2.0% | ECB deposit rate (configured) |
+| Gold volatility | $\sigma_S$ | 41% | EWMA (λ=0.94, GC=F) |
+| EUR/USD volatility | $\sigma_X$ | 6.2% | EWMA (λ=0.94, EURUSD=X) |
+| Correlation | $\rho$ | −0.30 | 126-day rolling (fallback) |
+| Gold convenience yield | $q$ | 3.6% | Futures term structure (GC=F vs GCJ26.CMX) |
 
 ## 2.3 Risk-Neutral Valuation
 
@@ -170,21 +170,21 @@ Combined, these techniques reduce standard errors by approximately 60%.
 
 | Metric | Value |
 |--------|-------|
-| Z Group Present Value | EUR −191,900,647 |
-| Alphabank Present Value | EUR +191,900,647 |
-| Standard Error | EUR 123,877 |
-| 95% Confidence Interval | [−192.1M, −191.7M] |
+| Z Group Present Value | EUR +63,968,230 |
+| Alphabank Present Value | EUR −63,968,230 |
+| Standard Error | EUR 896,173 |
+| 95% Confidence Interval | [+62.2M, +65.7M] |
 
 ## 4.2 Barrier Analysis
 
 | Metric | Value |
 |--------|-------|
-| Overall Knock-Out Rate | 92.99% |
-| Lower Barrier Breaches | 86.02% |
-| Upper Barrier Breaches | 6.97% |
-| Average Time to Knock-Out | 0.43 years (5.2 months) |
+| Overall Knock-Out Rate | 64.2% |
+| Lower Barrier Breaches | 27.3% |
+| Upper Barrier Breaches | 36.9% |
+| Average Time to Knock-Out | 0.98 years (11.8 months) |
 
-The asymmetry between barrier breaches reflects the negative EUR/USD drift implied by interest rate parity. With $r_{EUR} - r_{USD} = -2\%$ annually, the euro faces persistent depreciation pressure, making the lower barrier far more likely to be reached.
+The barrier breach profile has shifted dramatically compared to earlier market conditions. The upper barrier now accounts for the majority of knock-outs (37% vs 27% lower), reflecting the EUR/USD spot at 1.181—only 5.8% from the upper barrier versus 11.1% from the lower. The interest rate differential ($r_{EUR} - r_{USD} = -1.6\%$) still implies euro depreciation drift, but the proximity asymmetry dominates.
 
 **[INSERT FIGURE: monte_carlo_paths.png]**
 
@@ -194,11 +194,11 @@ Monte Carlo estimates stabilize as path counts increase:
 
 | Paths | Price Estimate | Standard Error |
 |-------|---------------|----------------|
-| 5,000 | EUR −191.4M | EUR 551K |
-| 10,000 | EUR −191.7M | EUR 381K |
-| 25,000 | EUR −191.8M | EUR 247K |
-| 50,000 | EUR −192.1M | EUR 174K |
-| 100,000 | EUR −191.9M | EUR 124K |
+| 5,000 | EUR +61.5M | EUR 3,844K |
+| 10,000 | EUR +61.6M | EUR 2,698K |
+| 25,000 | EUR +62.7M | EUR 1,768K |
+| 50,000 | EUR +63.1M | EUR 1,241K |
+| 100,000 | EUR +64.0M | EUR 896K |
 
 Standard errors decay proportionally to $1/\sqrt{n}$, confirming proper convergence behavior.
 
@@ -214,38 +214,42 @@ The specified strike of USD 4,600/oz warrants careful examination.
 
 **Forward Price Calculation:**
 
-$$F_{0,T} = S_0 \cdot e^{(r_{USD} - q) \cdot T} = 2750 \cdot e^{(0.045 - 0.005) \cdot 2} \approx \text{USD } 2{,}979\text{/oz}$$
+$$F_{0,T} = S_0 \cdot e^{(r_{USD} - q) \cdot T} = 5203 \cdot e^{(0.036 - 0.036) \cdot 2} \approx \text{USD } 5{,}203\text{/oz}$$
 
-The strike exceeds the forward by 54%, placing Z Group in a deeply out-of-the-money position:
+With convenience yield approximately equal to the USD risk-free rate, the forward is near spot. The strike sits 12% below the forward, placing Z Group in the money:
 
-$$\text{Moneyness} = \frac{F_{0,T}}{K} = \frac{2979}{4600} = 64.8\%$$
+$$\text{Moneyness} = \frac{F_{0,T}}{K} = \frac{5203}{4600} = 113.1\%$$
 
 **Alternative Strike Analysis:**
 
 | Strike | Forward Relationship | Z Group PV |
 |--------|---------------------|------------|
-| USD 2,800 | 6% below forward | EUR +2M |
-| USD 3,000 | At-the-money | EUR −31M |
-| USD 3,500 | 17% above forward | EUR −97M |
-| USD 4,600 | 54% above forward | EUR −192M |
+| USD 4,000 | 23% below forward | EUR +146M |
+| USD 4,300 | 17% below forward | EUR +101M |
+| USD 4,600 | 12% below forward | EUR +63M |
+| USD 4,900 | 6% below forward | EUR +29M |
+| USD 5,200 | At-the-money | EUR ~0M |
+| USD 5,500 | 6% above forward | EUR −27M |
 
 **[INSERT FIGURE: scenario_strike.png]**
 
 ## 5.2 Barrier Configuration
 
-The lower barrier at 1.05 sits only 2.8% below current spot:
+With EUR/USD at 1.181, the upper barrier at 1.25 is now the proximate risk:
 
-$$\text{Distance to Lower Barrier} = \frac{X_0 - L}{X_0} = \frac{1.08 - 1.05}{1.08} = 2.78\%$$
+$$\text{Distance to Upper Barrier} = \frac{U - X_0}{X_0} = \frac{1.25 - 1.181}{1.181} = 5.8\%$$
 
-Given 8% annual EUR/USD volatility and negative drift, barrier breach is near-certain over a two-year horizon.
+$$\text{Distance to Lower Barrier} = \frac{X_0 - L}{X_0} = \frac{1.181 - 1.05}{1.181} = 11.1\%$$
+
+With 6.2% annual EUR/USD volatility, the asymmetric positioning creates an upper-barrier-dominated knock-out profile.
 
 **Alternative Configurations:**
 
 | Corridor | Knock-Out Rate | Expected Duration |
 |----------|---------------|-------------------|
-| [1.05, 1.25] | 93% | 5 months |
-| [1.00, 1.30] | 66% | 10 months |
-| [0.95, 1.35] | 39% | 14 months |
+| [1.05, 1.25] | 64% | 12 months |
+| [1.00, 1.30] | 27% | 15 months |
+| [0.95, 1.35] | 10% | 17 months |
 
 **[INSERT FIGURE: scenario_barrier.png]**
 
@@ -257,21 +261,22 @@ Given 8% annual EUR/USD volatility and negative drift, barrier breach is near-ce
 
 | Greek | Value | Interpretation |
 |-------|-------|----------------|
-| $\Delta_{gold}$ | EUR 109,545 per USD 1 | First-order gold sensitivity |
-| $\Gamma_{gold}$ | EUR −491 | Gold convexity |
-| $\Delta_{FX}$ | EUR 2.26M per 0.01 FX | EUR/USD sensitivity |
-| $\mathcal{V}_{gold}$ | EUR −691K per 1% vol | Gold vega |
-| $\rho_{EUR}$ | EUR −11.7M per 1bp | EUR rate sensitivity |
+| $\Delta_{gold}$ | EUR 105,677 per USD 1 | First-order gold sensitivity |
+| $\Gamma_{gold}$ | EUR −669 | Gold convexity |
+| $\Delta_{FX}$ | EUR −8.18M per 0.01 FX | EUR/USD sensitivity (negative: upper barrier risk) |
+| $\mathcal{V}_{gold}$ | EUR −2.88M per 1% vol | Gold vega (higher vol increases KO probability) |
+| $\rho_{EUR}$ | EUR −1,031M per 1bp | EUR rate sensitivity |
+| $\rho_{corr}$ | EUR −973K per 0.05 corr | Correlation sensitivity |
 
 **[INSERT FIGURE: greeks_summary.png]**
 
 ## 6.2 Hedging Implications
 
-**Delta Hedging:** The gold delta of EUR 110K per dollar implies a hedge ratio of approximately:
+**Delta Hedging:** The gold delta of EUR 106K per dollar implies a hedge ratio of approximately:
 
-$$\text{Gold Hedge} = \frac{\Delta_{gold}}{S_0} \times K = \frac{109{,}545}{2750} \times 4600 \approx 183{,}000 \text{ oz}$$
+$$\text{Gold Hedge} = \frac{\Delta_{gold}}{S_0} \times K = \frac{105{,}677}{5203} \times 4600 \approx 93{,}400 \text{ oz}$$
 
-**Barrier Risk:** As EUR/USD approaches either barrier, gamma and delta become increasingly unstable—the characteristic "pin risk" of barrier options. Hedging costs will escalate significantly in the final days before a potential knock-out.
+**Barrier Risk:** With EUR/USD at 1.181, the upper barrier at 1.25 is only 5.8% away. As EUR/USD approaches either barrier, gamma and delta become increasingly unstable—the characteristic "pin risk" of barrier options. The negative FX delta (EUR −8.2M per 0.01) reflects that EUR appreciation toward 1.25 destroys contract value through knock-out.
 
 \newpage
 
@@ -283,11 +288,11 @@ To ensure robustness, we compared valuations across three model specifications:
 
 | Model | Z Group PV | Knock-Out Rate |
 |-------|-----------|----------------|
-| Base GBM | EUR −192.1M | 92.9% |
-| Heston Stochastic Vol | EUR −191.8M | 93.0% |
-| Merton Jump-Diffusion | EUR −191.7M | 93.0% |
+| Base GBM | EUR +63.1M | 64.5% |
+| Heston Stochastic Vol | EUR +64.1M | 64.1% |
+| Merton Jump-Diffusion | EUR +65.7M | 64.1% |
 
-All models converge within 0.2%, confirming that the barrier structure dominates pricing dynamics. Model specification risk is secondary.
+All models converge within 4%, with Heston and Merton producing slightly higher valuations due to stochastic volatility and jump dynamics amplifying the in-the-money payoff. Model specification risk remains secondary to market parameter uncertainty.
 
 **[INSERT FIGURE: model_comparison.png]**
 
@@ -295,11 +300,11 @@ All models converge within 0.2%, confirming that the barrier structure dominates
 
 The vanilla gold forward (without barriers) provides a sanity check:
 
-$$V_{vanilla} = e^{-r_{EUR} \cdot T} \cdot N \cdot \frac{F_{0,T} - K}{K} = e^{-0.025 \times 2} \cdot 500M \cdot \frac{2979 - 4600}{4600}$$
+$$V_{vanilla} = e^{-r_{EUR} \cdot T} \cdot N \cdot \frac{F_{0,T} - K}{K} = e^{-0.020 \times 2} \cdot 500M \cdot \frac{5203 - 4600}{4600}$$
 
-$$V_{vanilla} = \text{EUR } -167{,}598{,}411$$
+$$V_{vanilla} = \text{EUR } +63{,}004{,}791$$
 
-The knock-out version (EUR −192M) is EUR 24M worse than the vanilla, representing the expected cost of early termination when gold is below strike.
+The knock-out version (EUR +64.0M) is EUR 1.0M higher than the vanilla, reflecting that early termination locks in profits when gold is above strike — a reversal from the prior regime where knock-outs destroyed value.
 
 \newpage
 
@@ -307,21 +312,23 @@ The knock-out version (EUR −192M) is EUR 24M worse than the vanilla, represent
 
 ## 8.1 Summary of Findings
 
-The proposed structure is technically sound and priceable using standard Monte Carlo techniques. However, two features merit discussion:
+The proposed structure is technically sound and priceable using standard Monte Carlo techniques. The February 2026 market environment has fundamentally altered the risk profile:
 
-1. **Strike positioning:** The USD 4,600 strike creates a deeply out-of-the-money position for Z Group. Clarification of the commercial rationale is recommended.
+1. **Position reversal:** Gold's surge to $5,203/oz places Z Group firmly in the money (113% moneyness), with a positive PV of EUR +64M. This contrasts sharply with earlier market conditions where the position was deeply out-of-the-money.
 
-2. **Barrier proximity:** The 93% knock-out probability results in an expected contract life of only 5 months—potentially misaligned with a 2-year hedging mandate.
+2. **Barrier risk shift:** The upper EUR/USD barrier at 1.25 is now only 5.8% from spot, making it the primary knock-out driver (37% of paths). The 64% total knock-out rate and 12-month expected duration represent a more balanced risk profile than the prior 93%/5-month scenario.
+
+3. **Elevated volatility:** Gold volatility at 41% (EWMA) is more than double historical norms, increasing both the potential upside for Z Group and the mark-to-market volatility for Alphabank's hedging book.
 
 ## 8.2 Recommendations
 
-We recommend proceeding to term sheet stage contingent upon:
+We recommend proceeding to term sheet stage with the following considerations:
 
-1. Confirmation from Relationship Management regarding Z Group's acceptance of the strike level and its implications
+1. Alphabank should carefully assess credit exposure given the positive Z Group PV, ensuring adequate collateral arrangements
 
-2. Discussion of whether alternative barrier configurations (e.g., [1.00, 1.30]) would better serve the client's hedging objectives
+2. The upper barrier proximity (5.8%) warrants active monitoring—EUR appreciation events could trigger knock-out and crystallize Z Group's gain
 
-3. Documentation of appropriate risk disclosures regarding the high knock-out probability
+3. Consider whether alternative barrier configurations (e.g., [1.00, 1.30] with 27% KO rate) would provide Z Group with more durable hedging protection
 
 ## 8.3 Next Steps
 

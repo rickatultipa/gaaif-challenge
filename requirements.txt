@@ -10,8 +10,13 @@ scipy>=1.7.0
 matplotlib>=3.4.0
 seaborn>=0.11.0
 
-# Excel output
+# Excel output & document generation
 openpyxl>=3.0.0
+python-docx>=1.0.0
+
+# Interactive dashboard
+streamlit>=1.30.0
+plotly>=5.18.0
 
 # Optional: Market data fetching
 yfinance>=0.2.0
